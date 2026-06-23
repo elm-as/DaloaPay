@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: daloapay
+    env: node
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: FUSION_API_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SITE_URL
+        value: https://daloamarket.shop
