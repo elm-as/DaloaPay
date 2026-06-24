@@ -199,6 +199,7 @@ app.get('/check-payment', async (req, res) => {
         const { error: rpcErr } = await supabase.rpc(rpc, { p_transaction_id: tx.id });
         if (rpcErr) {
           console.error(`RPC ${rpc} failed for tx ${tx.id}:`, rpcErr);
+          await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
           return res.status(500).json({ success: false, message: `Activation échouée: ${rpcErr.message}` });
         }
       } else {
@@ -276,6 +277,7 @@ app.post('/payment-webhook', async (req, res) => {
         const { error: rpcErr } = await supabase.rpc(rpc, { p_transaction_id: tx.id });
         if (rpcErr) {
           console.error(`Webhook RPC ${rpc} failed for tx ${tx.id}:`, rpcErr);
+          await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
           return res.status(500).json({ ok: false, message: `Activation échouée: ${rpcErr.message}` });
         }
       } else {
