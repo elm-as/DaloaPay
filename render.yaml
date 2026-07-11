@@ -13,4 +13,4 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: SITE_URL
-        value: https://daloamarket.shop
+        value: https://daloamarket.netlify.app
