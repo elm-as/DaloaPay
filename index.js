@@ -64,6 +64,73 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
+// 0d) Vérifier le statut d'un paiement (appelé par PaymentReturnPage)
+app.get('/check-payment', async (req, res) => {
+  try {
+    checkConfig();
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const transactionId = req.query.transactionId;
+    if (!transactionId) {
+      return res.status(400).json({ success: false, message: 'transactionId requis' });
+    }
+
+    // Chercher d'abord dans escrow_transactions
+    let { data: escrow } = await supabase
+      .from('escrow_transactions')
+      .select('*')
+      .eq('id', transactionId)
+      .maybeSingle();
+
+    if (escrow) {
+      const statusMap = {
+        pending: 'pending',
+        funded: 'paid',
+        released: 'paid',
+        cancelled: 'failure',
+        failed: 'failure',
+      };
+      return res.json({
+        success: true,
+        status: statusMap[escrow.status] || 'unknown',
+        transactionId: escrow.id,
+        amount: escrow.total_amount,
+        paymentMethod: escrow.payment_method,
+        confirmedAt: escrow.funded_at,
+      });
+    }
+
+    // Sinon chercher dans monetization_transactions
+    let { data: tx } = await supabase
+      .from('monetization_transactions')
+      .select('*')
+      .eq('id', transactionId)
+      .maybeSingle();
+
+    if (tx) {
+      const statusMap = {
+        pending: 'pending',
+        confirmed: 'paid',
+        failed: 'failure',
+      };
+      return res.json({
+        success: true,
+        status: statusMap[tx.status] || 'unknown',
+        transactionId: tx.id,
+        amount: tx.amount,
+        confirmedAt: tx.confirmed_at,
+      });
+    }
+
+    return res.status(404).json({ success: false, message: 'Transaction introuvable', status: 'unknown' });
+  } catch (e) {
+    console.error('ERROR /check-payment:', e.message || e);
+    return res.status(500).json({ success: false, message: e.message, status: 'unknown' });
+  }
+});
+
 // 1) Créer un paiement
 app.post('/create-payment', async (req, res) => {
   console.log('POST /create-payment received', req.body);
