@@ -318,7 +318,7 @@ app.post('/create-payment', async (req, res) => {
     }
 
     const baseUrl = SITE_URL.replace(/\/$/, '');
-    const returnUrl = `${baseUrl}/payment/success?txid=${transactionId}&type=${type}`;
+    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${type === 'order' ? '&order_id=' + transactionId : ''}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
     const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)', listing_pack_10: 'Pack 10 annonces (500 FCFA)', order: 'Achat de produit sur DaloaMarket' };
