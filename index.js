@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config({ override: true });
 
 const app = express();
 app.use(cors());
@@ -16,94 +17,144 @@ const SITE_URL = process.env.SITE_URL || 'https://daloamarket.shop';
 // Validation config
 function checkConfig() {
   console.log('Checking config...');
-  console.log('FUSION_API_URL:', FUSION_API_URL ? 'OK' : 'MISSING');
-  console.log('SUPABASE_URL:', SUPABASE_URL ? 'OK' : 'MISSING');
-  console.log('SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'OK' : 'MISSING');
-  
   if (!FUSION_API_URL || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Config incomplete: FUSION_API_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY required');
   }
-  console.log('Config OK');
 }
 
-// Health check
+// --- PRICING CONSTANTS (SYNC WITH src/lib/pricing.ts) ---
+const PRICING = {
+  DELIVERY_MIN: 500,
+  DELIVERY_RATE_PER_KM: 200,
+  PLATFORM_FEE_RATE: 0.06
+};
+
 app.get('/', (req, res) => {
   res.json({ ok: true, message: 'DaloaMarket Payment API' });
 });
 
-// Temp: get outbound IP
+// 0) Diagnostic : IP publique du serveur (pour whitelist Money Fusion)
 app.get('/ip', async (req, res) => {
   try {
-    const response = await fetch('https://api.ipify.org?format=json');
-    const data = await response.json();
-    res.json({ ip: data.ip, source: 'Railway outbound' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const [v4, v6] = await Promise.allSettled([
+      fetch('https://api.ipify.org?format=json').then(r => r.json()).catch(() => ({ ip: 'injoignable (api.ipify.org)' })),
+      fetch('https://api64.ipify.org?format=json').then(r => r.json()).catch(() => ({ ip: 'N/A' })),
+    ]);
+    res.json({
+      ipv4: v4.status === 'fulfilled' ? v4.value.ip : 'erreur',
+      ipv6: v6.status === 'fulfilled' ? v6.value.ip : 'N/A',
+      message: "Ajoute cette IPv4 dans ton dashboard Money Fusion (section 'API de paiement' → IP autorisees)",
+    });
+  } catch { res.json({ error: 'Impossible de récupérer l\'IP' }); }
+});
+
+// 0b) Diagnostic : config actuelle
+app.get('/config', (req, res) => {
+  res.json({
+    FUSION_API_URL: FUSION_API_URL || 'NON DEFINI',
+    SUPABASE_URL: SUPABASE_URL || 'NON DEFINI',
+    SUPABASE_KEY_OK: !!SUPABASE_SERVICE_ROLE_KEY,
+    SITE_URL,
+    PORT: process.env.PORT || 3000,
+  });
+});
+
+// 0c) Healthcheck
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
 // 1) Créer un paiement
 app.post('/create-payment', async (req, res) => {
-  console.log('POST /create-payment received');
-  console.log('Body:', req.body);
+  console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
+    const { type, amount, customerName, customerPhone, userId, metadata, orderInput } = req.body;
     
-    const { type, amount, customerName, customerPhone, userId, metadata } = req.body;
-    
-    if (!type || !['seller_badge'].includes(type)) {
+    if (!type || !['seller_badge', 'listing_pack_10', 'order'].includes(type)) {
       return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
-    }
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Montant invalide.' });
-    }
-    if (!customerName || !customerPhone || !userId) {
-      return res.status(400).json({ success: false, message: 'Informations client requises.' });
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Crée la transaction
-    const { data: tx, error: txErr } = await supabase
-      .from('monetization_transactions')
-      .insert({
-        user_id: userId,
-        type,
-        amount: Math.round(amount),
-        status: 'pending',
-      })
-      .select('id')
-      .single();
+    let transactionId = '';
+    let finalAmount = amount;
+    
+    if (type === 'order') {
+      // 1. Lire la db pour le prix de l'article
+      const { data: listing, error: listingErr } = await supabase
+        .from('listings')
+        .select('price, user_id')
+        .eq('id', orderInput.listing_id)
+        .single();
+      
+      if (listingErr || !listing) {
+        console.error('Listing lookup error:', listingErr);
+        return res.status(404).json({ success: false, message: 'Article introuvable' });
+      }
+      
+      const deliveryFee = PRICING.DELIVERY_MIN;
+      const commission = Math.round(listing.price * PRICING.PLATFORM_FEE_RATE);
+      finalAmount = listing.price + deliveryFee + commission;
+      
+      // 2. Créer l'escrow_transaction
+      const { data: escrow, error: escrowErr } = await supabase
+        .from('escrow_transactions')
+        .insert({
+          order_id: require('crypto').randomUUID(),
+          buyer_id: userId,
+          seller_id: listing.user_id,
+          total_amount: finalAmount,
+          seller_amount: listing.price - commission,
+          delivery_fee: deliveryFee,
+          platform_fee: commission,
+          status: 'pending',
+          payment_method: 'mobile_money'
+        })
+        .select('id')
+        .single();
+        
+      if (escrowErr || !escrow) {
+        console.error('Escrow creation error:', escrowErr);
+        return res.status(500).json({ success: false, message: 'Erreur création escrow' });
+      }
+      transactionId = escrow.id;
 
-    if (txErr || !tx) {
-      return res.status(500).json({ success: false, message: txErr?.message || 'Erreur transaction.' });
+    } else {
+      if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Montant invalide.' });
+      
+      const { data: tx, error: txErr } = await supabase
+        .from('monetization_transactions')
+        .insert({ user_id: userId, type, amount: Math.round(amount), status: 'pending' })
+        .select('id').single();
+        
+      if (txErr || !tx) return res.status(500).json({ success: false, message: txErr?.message || 'Erreur transaction.' });
+      transactionId = tx.id;
     }
 
-    const transactionId = tx.id;
     const baseUrl = SITE_URL.replace(/\/$/, '');
-    const returnUrl = `${baseUrl}/payment/succes?txid=${transactionId}`;
+    const returnUrl = `${baseUrl}/payment/success?txid=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
-    // Appelle Money Fusion
-    const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)' };
+    const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)', listing_pack_10: 'Pack 10 annonces (500 FCFA)', order: 'Achat de produit sur DaloaMarket' };
     const fusionPayload = {
-      totalPrice: Math.round(amount),
-      article: [{ [labelByType[type] || type]: Math.round(amount) }],
-      personal_Info: [{ userId, transactionId, type, ...(metadata || {}) }],
-      numeroSend: customerPhone,
-      nomclient: customerName,
+      totalPrice: Math.round(finalAmount),
+      article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
+      personal_Info: [{ userId, transactionId, type, ...(metadata || {}), ...(orderInput || {}) }],
+      numeroSend: customerPhone || '0000000000',
+      nomclient: customerName || 'Client DaloaMarket',
       return_url: returnUrl,
       webhook_url: webhookUrl,
     };
 
-    console.log('Calling Money Fusion API:', FUSION_API_URL);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
-    
     let fusionRes, fusionData;
     try {
+      console.log('Calling FUSION_API_URL:', FUSION_API_URL);
+      console.log('Payload:', JSON.stringify(fusionPayload).slice(0, 300));
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
       fusionRes = await fetch(FUSION_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -111,202 +162,140 @@ app.post('/create-payment', async (req, res) => {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
-      fusionData = await fusionRes.json().catch(() => null);
-      console.log('Money Fusion response:', fusionRes.status, fusionData);
-    } catch (fetchErr) {
-      clearTimeout(timeoutId);
-      console.error('Money Fusion fetch error:', fetchErr.message);
-      await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', transactionId);
-      return res.status(502).json({ success: false, message: 'Money Fusion injoignable: ' + fetchErr.message });
+      const rawText = await fusionRes.text();
+      console.log('Money Fusion response status:', fusionRes.status);
+      console.log('Money Fusion response body:', rawText.slice(0, 500));
+      fusionData = (() => { try { return JSON.parse(rawText); } catch { return null; } })();
+    } catch (e) {
+      console.error('Money Fusion fetch error:', e.message || e);
+      return res.status(502).json({ success: false, message: 'Money Fusion injoignable: ' + (e.message || 'erreur reseau') });
     }
     
     if (!fusionRes.ok || !fusionData || fusionData.statut === false) {
-      await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', transactionId);
       return res.status(502).json({ success: false, message: fusionData?.message || 'Erreur Money Fusion' });
     }
 
-    // Stocke le token
-    await supabase
-      .from('monetization_transactions')
-      .update({ provider_token: fusionData.token })
-      .eq('id', transactionId);
-
-    return res.json({
-      success: true,
-      transactionId,
-      token: fusionData.token,
-      paymentUrl: fusionData.url,
-      message: fusionData.message || 'Paiement en cours',
-    });
-    
+    // Sauvegarder le token
+    if (type === 'order') {
+      await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
+      return res.json({ success: true, order_id: transactionId, token: fusionData.token, payment_url: fusionData.url });
+    } else {
+      await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
+      return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: fusionData.url });
+    }
   } catch (e) {
-    console.error('Create payment error:', e);
-    return res.status(500).json({ success: false, message: e.message || 'Erreur serveur' });
+    console.error('ERROR /create-payment:', e.message || e);
+    return res.status(500).json({ success: false, message: e.message });
   }
 });
 
-// 2) Vérifier le statut
-app.get('/check-payment', async (req, res) => {
-  try {
-    checkConfig();
-    
-    const { transactionId } = req.query;
-    if (!transactionId) {
-      return res.status(400).json({ success: false, message: 'transactionId requis' });
-    }
-
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
-
-    const { data: tx, error } = await supabase
-      .from('monetization_transactions')
-      .select('id, type, status, amount, provider_token, confirmed_at')
-      .eq('id', transactionId)
-      .maybeSingle();
-
-    if (error || !tx) {
-      return res.status(404).json({ success: false, message: 'Transaction introuvable' });
-    }
-
-    if (tx.status === 'confirmed') {
-      return res.json({ success: true, status: 'paid', transactionId: tx.id, amount: tx.amount, confirmedAt: tx.confirmed_at });
-    }
-    if (tx.status === 'failed') {
-      return res.json({ success: true, status: 'failure', transactionId: tx.id, amount: tx.amount });
-    }
-
-    // Vérifie Money Fusion
-    if (!tx.provider_token) {
-      return res.json({ success: true, status: 'pending', transactionId: tx.id, amount: tx.amount, message: 'Token absent' });
-    }
-
-    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${tx.provider_token}`);
-    const fusionData = await fusionRes.json().catch(() => null);
-
-    if (!fusionData || fusionData.statut !== true || !fusionData.data) {
-      return res.json({ success: true, status: 'pending', transactionId: tx.id, amount: tx.amount });
-    }
-
-    const fusionStatus = fusionData.data.statut;
-    const paymentMethod = fusionData.data.moyen;
-
-    if (fusionStatus === 'paid') {
-      const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
-      const rpc = rpcByType[tx.type];
-      
-      if (rpc) {
-        const { error: rpcErr } = await supabase.rpc(rpc, { p_transaction_id: tx.id });
-        if (rpcErr) {
-          console.error(`RPC ${rpc} failed for tx ${tx.id}:`, rpcErr);
-          await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
-          return res.status(500).json({ success: false, message: `Activation échouée: ${rpcErr.message}` });
-        }
-      } else {
-        await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
-      }
-      
-      return res.json({ success: true, status: 'paid', transactionId: tx.id, amount: tx.amount, paymentMethod, confirmedAt: new Date().toISOString() });
-    }
-
-    if (fusionStatus === 'failure' || fusionStatus === 'no paid') {
-      await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', tx.id);
-      return res.json({ success: true, status: fusionStatus, transactionId: tx.id, amount: tx.amount });
-    }
-
-    return res.json({ success: true, status: 'pending', transactionId: tx.id, amount: tx.amount });
-    
-  } catch (e) {
-    console.error('Check payment error:', e);
-    return res.status(500).json({ success: false, message: e.message || 'Erreur serveur' });
-  }
-});
-
-// 3) Webhook Money Fusion
+// 2) Webhook Money Fusion
 app.post('/payment-webhook', async (req, res) => {
   try {
     checkConfig();
-    
     const payload = req.body;
     const personal = Array.isArray(payload?.personal_Info) ? payload.personal_Info[0] : null;
     const transactionId = personal?.transactionId;
+    const type = personal?.type;
 
-    if (!transactionId) {
-      return res.status(400).json({ ok: false, message: 'Transaction ID manquant' });
-    }
+    if (!transactionId || !type) return res.status(400).json({ ok: false, message: 'Invalid payload' });
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Récupère la transaction
-    const { data: tx, error } = await supabase
-      .from('monetization_transactions')
-      .select('id, type, status, provider_token')
-      .eq('id', transactionId)
-      .maybeSingle();
+    const isOrder = type === 'order';
+    const table = isOrder ? 'escrow_transactions' : 'monetization_transactions';
+    
+    const { data: tx, error } = await supabase.from(table).select('*').eq('id', transactionId).maybeSingle();
+    if (error || !tx) return res.status(404).json({ ok: false, message: 'Transaction introuvable' });
 
-    if (error || !tx) {
-      return res.status(404).json({ ok: false, message: 'Transaction introuvable' });
-    }
-
-    // Déjà confirmée
-    if (tx.status === 'confirmed') {
+    // Verif statut DB
+    if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
       return res.json({ ok: true, message: 'Déjà confirmée' });
     }
 
-    // Vérifie le statut via Money Fusion
-    if (!tx.provider_token) {
-      return res.status(400).json({ ok: false, message: 'Token absent' });
-    }
+    const token = isOrder ? tx.payment_reference : tx.provider_token;
+    if (!token) return res.status(400).json({ ok: false, message: 'Token absent' });
 
-    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${tx.provider_token}`);
+    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${token}`);
     const fusionData = await fusionRes.json().catch(() => null);
 
     if (!fusionData || fusionData.statut !== true || !fusionData.data) {
-      return res.json({ ok: true, message: 'Statut non confirmé', status: 'pending' });
+      return res.json({ ok: true, status: 'pending' });
     }
 
     const fusionStatus = fusionData.data.statut;
 
     if (fusionStatus === 'paid') {
-      const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
-      const rpc = rpcByType[tx.type];
-      
-      if (rpc) {
-        const { error: rpcErr } = await supabase.rpc(rpc, { p_transaction_id: tx.id });
-        if (rpcErr) {
-          console.error(`Webhook RPC ${rpc} failed for tx ${tx.id}:`, rpcErr);
-          await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
-          return res.status(500).json({ ok: false, message: `Activation échouée: ${rpcErr.message}` });
-        }
+      if (isOrder) {
+        // Validation commande : escrow = funded
+        await supabase.from('escrow_transactions').update({ status: 'funded', funded_at: new Date().toISOString() }).eq('id', transactionId);
+
+        // Générer deux OTP distincts (6 chiffres chacun)
+        const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+        const pickupOTP = generateOTP();
+        const deliveryOTP = generateOTP();
+
+        // Créer l'assignation de livraison avec les deux OTP
+        const address = personal.delivery_address || 'Daloa';
+        const deliveryLat = personal.delivery_lat || null;
+        const deliveryLng = personal.delivery_lng || null;
+
+        await supabase.from('delivery_assignments').insert({
+          order_id: tx.order_id,
+          delivery_person_id: null,
+          status: 'awaiting_pickup',
+          pickup_confirmed_by_seller: false,
+          pickup_confirmed_at: null,
+          pickup_otp: pickupOTP,
+          delivery_otp: deliveryOTP,
+          pickup_otp_attempts: 0,
+          delivery_otp_attempts: 0,
+          accepted_at: null,
+          delivery_address: address,
+          delivery_lat: deliveryLat,
+          delivery_lng: deliveryLng,
+          pickup_gps: null,
+          pickup_gps_distance_m: null,
+          delivery_gps: null,
+          delivery_gps_distance_m: null,
+          pickup_photo_url: null,
+          delivered_at: null,
+          buyer_confirmed_at: null,
+          auto_released_at: null
+        });
+
+        // Mettre à jour le statut de la commande
+        await supabase.from('orders').update({ status: 'paid' }).eq('id', tx.order_id);
       } else {
-        await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', tx.id);
+        const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
+        if (rpcByType[type]) {
+          await supabase.rpc(rpcByType[type], { p_transaction_id: transactionId });
+        } else if (type === 'listing_pack_10') {
+          await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 10 });
+        }
+        await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', transactionId);
       }
-      
-      return res.json({ ok: true, message: 'Confirmée', status: 'paid' });
+      return res.json({ ok: true, status: 'paid' });
     }
 
     if (fusionStatus === 'failure' || fusionStatus === 'no paid') {
-      await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', tx.id);
-      return res.json({ ok: true, message: 'Échec enregistré', status: fusionStatus });
+      await supabase.from(table).update({ status: isOrder ? 'cancelled' : 'failed' }).eq('id', transactionId);
+      return res.json({ ok: true, status: fusionStatus });
     }
 
-    return res.json({ ok: true, message: 'En attente', status: 'pending' });
-    
+    return res.json({ ok: true, status: 'pending' });
   } catch (e) {
-    console.error('Webhook error:', e);
-    return res.status(500).json({ ok: false, message: e.message || 'Erreur serveur' });
+    return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
-// Error handler
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
   res.status(500).json({ success: false, message: err.message || 'Internal error' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Payment API running on port ${PORT}`);
-});
+console.log('FUSION_API_URL from env:', JSON.stringify(process.env.FUSION_API_URL));
+console.log('SUPABASE_URL from env:', JSON.stringify(process.env.SUPABASE_URL));
+app.listen(PORT, () => console.log(`Payment API running on port ${PORT}`));
