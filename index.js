@@ -65,6 +65,7 @@ app.get('/health', (req, res) => {
 });
 
 // 0d) Vérifier le statut d'un paiement (appelé par PaymentReturnPage)
+// Si la DB est encore en "pending", on interroge Money Fusion directement
 app.get('/check-payment', async (req, res) => {
   try {
     checkConfig();
@@ -77,6 +78,15 @@ app.get('/check-payment', async (req, res) => {
       return res.status(400).json({ success: false, message: 'transactionId requis' });
     }
 
+    const statusMap = {
+      pending: 'pending',
+      funded: 'paid',
+      released: 'paid',
+      cancelled: 'failure',
+      failed: 'failure',
+      confirmed: 'paid',
+    };
+
     // Chercher d'abord dans escrow_transactions
     let { data: escrow } = await supabase
       .from('escrow_transactions')
@@ -85,24 +95,85 @@ app.get('/check-payment', async (req, res) => {
       .maybeSingle();
 
     if (escrow) {
-      const statusMap = {
-        pending: 'pending',
-        funded: 'paid',
-        released: 'paid',
-        cancelled: 'failure',
-        failed: 'failure',
-      };
+      // Si déjà payé, renvoyer directement
+      if (escrow.status !== 'pending') {
+        return res.json({
+          success: true,
+          status: statusMap[escrow.status] || 'unknown',
+          transactionId: escrow.id,
+          amount: escrow.total_amount,
+          paymentMethod: escrow.payment_method,
+          confirmedAt: escrow.funded_at,
+        });
+      }
+
+      // Si pending, vérifier chez Money Fusion avec le payment_reference
+      if (escrow.payment_reference) {
+        try {
+          const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${escrow.payment_reference}`;
+          console.log('check-payment: verifying with MoneyFusion:', fusionUrl);
+          const fusionRes = await fetch(fusionUrl);
+          const fusionData = await fusionRes.json().catch(() => null);
+
+          if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
+            // Le paiement est bien fait → mettre à jour la DB
+            await supabase
+              .from('escrow_transactions')
+              .update({ status: 'funded', funded_at: new Date().toISOString() })
+              .eq('id', escrow.id);
+
+            // Même logique que le webhook : créer delivery_assignments, etc.
+            console.log('check-payment: payment confirmed, triggering delivery flow...');
+            const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+            const pickupOTP = generateOTP();
+            const deliveryOTP = generateOTP();
+
+            await supabase.from('delivery_assignments').insert({
+              order_id: escrow.order_id,
+              delivery_person_id: null,
+              status: 'awaiting_pickup',
+              pickup_confirmed_by_seller: false,
+              pickup_otp: pickupOTP,
+              delivery_otp: deliveryOTP,
+              pickup_otp_attempts: 0,
+              delivery_otp_attempts: 0,
+            });
+
+            await supabase.from('orders').update({ status: 'paid' }).eq('id', escrow.order_id);
+
+            return res.json({
+              success: true,
+              status: 'paid',
+              transactionId: escrow.id,
+              amount: escrow.total_amount,
+              paymentMethod: escrow.payment_method,
+              confirmedAt: escrow.funded_at,
+            });
+          }
+
+          if (fusionData && fusionData.data?.statut === 'failure') {
+            await supabase
+              .from('escrow_transactions')
+              .update({ status: 'cancelled' })
+              .eq('id', escrow.id);
+            return res.json({ success: true, status: 'failure', transactionId: escrow.id });
+          }
+        } catch (fusionErr) {
+          console.log('check-payment: MoneyFusion check failed, will retry later:', fusionErr.message);
+          // Money Fusion injoignable → on laisse pending, le frontend pourra réessayer
+        }
+      }
+
       return res.json({
         success: true,
-        status: statusMap[escrow.status] || 'unknown',
+        status: 'pending',
         transactionId: escrow.id,
         amount: escrow.total_amount,
         paymentMethod: escrow.payment_method,
-        confirmedAt: escrow.funded_at,
       });
     }
 
-    // Sinon chercher dans monetization_transactions
+    // Chercher dans monetization_transactions
     let { data: tx } = await supabase
       .from('monetization_transactions')
       .select('*')
@@ -110,17 +181,62 @@ app.get('/check-payment', async (req, res) => {
       .maybeSingle();
 
     if (tx) {
-      const statusMap = {
-        pending: 'pending',
-        confirmed: 'paid',
-        failed: 'failure',
-      };
+      if (tx.status !== 'pending') {
+        return res.json({
+          success: true,
+          status: statusMap[tx.status] || 'unknown',
+          transactionId: tx.id,
+          amount: tx.amount,
+          confirmedAt: tx.confirmed_at,
+        });
+      }
+
+      // Si pending, vérifier chez Money Fusion
+      if (tx.provider_token) {
+        try {
+          const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${tx.provider_token}`;
+          console.log('check-payment: verifying monetization with MoneyFusion:', fusionUrl);
+          const fusionRes = await fetch(fusionUrl);
+          const fusionData = await fusionRes.json().catch(() => null);
+
+          if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
+            const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
+            if (rpcByType[tx.type]) {
+              await supabase.rpc(rpcByType[tx.type], { p_transaction_id: tx.id });
+            } else if (tx.type === 'listing_pack_10') {
+              await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 10 });
+            }
+            await supabase
+              .from('monetization_transactions')
+              .update({ status: 'confirmed', confirmed_at: new Date().toISOString() })
+              .eq('id', tx.id);
+
+            return res.json({
+              success: true,
+              status: 'paid',
+              transactionId: tx.id,
+              amount: tx.amount,
+              confirmedAt: new Date().toISOString(),
+            });
+          }
+
+          if (fusionData && fusionData.data?.statut === 'failure') {
+            await supabase
+              .from('monetization_transactions')
+              .update({ status: 'failed' })
+              .eq('id', tx.id);
+            return res.json({ success: true, status: 'failure', transactionId: tx.id });
+          }
+        } catch (fusionErr) {
+          console.log('check-payment: MoneyFusion check failed, will retry later:', fusionErr.message);
+        }
+      }
+
       return res.json({
         success: true,
-        status: statusMap[tx.status] || 'unknown',
+        status: tx.status,
         transactionId: tx.id,
         amount: tx.amount,
-        confirmedAt: tx.confirmed_at,
       });
     }
 
