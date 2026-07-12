@@ -125,7 +125,7 @@ app.get('/check-payment', async (req, res) => {
       // Si pending, vérifier chez Money Fusion avec le payment_reference
       if (escrow.payment_reference) {
         try {
-          const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${escrow.payment_reference}`;
+          const fusionUrl = `https://pay.moneyfusion.net/paiementNotif/${escrow.payment_reference}`;
           console.log('check-payment: verifying with MoneyFusion:', fusionUrl);
           const fusionRes = await fetch(fusionUrl, {
             headers: {
@@ -223,7 +223,7 @@ app.get('/check-payment', async (req, res) => {
       // Si pending, vérifier chez Money Fusion
       if (tx.provider_token) {
         try {
-          const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${tx.provider_token}`;
+          const fusionUrl = `https://pay.moneyfusion.net/paiementNotif/${tx.provider_token}`;
           console.log('check-payment: verifying monetization with MoneyFusion:', fusionUrl);
           const fusionRes = await fetch(fusionUrl, {
             headers: {
@@ -439,7 +439,7 @@ app.post('/payment-webhook', async (req, res) => {
     const token = isOrder ? tx.payment_reference : tx.provider_token;
     if (!token) return res.status(400).json({ ok: false, message: 'Token absent' });
 
-    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${token}`, {
+    const fusionRes = await fetch(`https://pay.moneyfusion.net/paiementNotif/${token}`, {
       headers: {
         'Accept': 'application/json',
         'User-Agent': 'DaloaMarket-Server/1.0'
