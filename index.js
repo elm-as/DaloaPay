@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const dns = require('dns');
-require('dotenv').config({ override: true });
+require('dotenv').config();
 
 // Node 18+ fetch() préfère l'IPv6, ce qui fait planter les requêtes vers MoneyFusion sur Render
 dns.setDefaultResultOrder('ipv4first');
