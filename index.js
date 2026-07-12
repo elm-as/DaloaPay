@@ -326,6 +326,7 @@ app.post('/create-payment', async (req, res) => {
           listing_id: orderInput.listing_id,
           product_amount: listing.price,
           delivery_fee: deliveryFee,
+          platform_commission: commission,
           total_amount: finalAmount,
           delivery_address: orderInput.delivery_address || 'Daloa',
           delivery_mode: orderInput.delivery_mode || 'delivery',
@@ -336,7 +337,7 @@ app.post('/create-payment', async (req, res) => {
 
       if (orderErr || !order) {
         console.error('Order creation error:', orderErr);
-        return res.status(500).json({ success: false, message: 'Erreur création order' });
+        return res.status(500).json({ success: false, message: 'Erreur création order: ' + (orderErr?.message || 'unknown') });
       }
 
       // 2. Créer l'escrow_transaction
