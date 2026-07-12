@@ -73,7 +73,8 @@ app.get('/check-payment', async (req, res) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const transactionId = req.query.transactionId;
+    // MoneyFusion renvoie parfois le token dans 'txid' au lieu de notre transactionId
+    const transactionId = req.query.transactionId || req.query.txid || req.query.token;
     if (!transactionId) {
       return res.status(400).json({ success: false, message: 'transactionId requis' });
     }
@@ -87,12 +88,22 @@ app.get('/check-payment', async (req, res) => {
       confirmed: 'paid',
     };
 
-    // Chercher d'abord dans escrow_transactions
+    // Chercher d'abord dans escrow_transactions par id Supabase
     let { data: escrow } = await supabase
       .from('escrow_transactions')
       .select('*')
       .eq('id', transactionId)
       .maybeSingle();
+
+    // Fallback : MoneyFusion a renvoyé son propre token → chercher par payment_reference
+    if (!escrow) {
+      const { data: escrowByRef } = await supabase
+        .from('escrow_transactions')
+        .select('*')
+        .eq('payment_reference', transactionId)
+        .maybeSingle();
+      escrow = escrowByRef;
+    }
 
     if (escrow) {
       // Si déjà payé, renvoyer directement
@@ -179,6 +190,15 @@ app.get('/check-payment', async (req, res) => {
       .select('*')
       .eq('id', transactionId)
       .maybeSingle();
+
+    if (!tx) {
+      const { data: txByRef } = await supabase
+        .from('monetization_transactions')
+        .select('*')
+        .eq('provider_token', transactionId)
+        .maybeSingle();
+      tx = txByRef;
+    }
 
     if (tx) {
       if (tx.status !== 'pending') {
