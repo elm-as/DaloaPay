@@ -2,7 +2,11 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const dns = require('dns');
 require('dotenv').config({ override: true });
+
+// Node 18+ fetch() préfère l'IPv6, ce qui fait planter les requêtes vers MoneyFusion sur Render
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 app.use(cors());
@@ -123,7 +127,12 @@ app.get('/check-payment', async (req, res) => {
         try {
           const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${escrow.payment_reference}`;
           console.log('check-payment: verifying with MoneyFusion:', fusionUrl);
-          const fusionRes = await fetch(fusionUrl);
+          const fusionRes = await fetch(fusionUrl, {
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'DaloaMarket-Server/1.0'
+            }
+          });
           const fusionData = await fusionRes.json().catch(() => null);
 
           if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
@@ -216,7 +225,12 @@ app.get('/check-payment', async (req, res) => {
         try {
           const fusionUrl = `https://www.pay.moneyfusion.net/paiementNotif/${tx.provider_token}`;
           console.log('check-payment: verifying monetization with MoneyFusion:', fusionUrl);
-          const fusionRes = await fetch(fusionUrl);
+          const fusionRes = await fetch(fusionUrl, {
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'DaloaMarket-Server/1.0'
+            }
+          });
           const fusionData = await fusionRes.json().catch(() => null);
 
           if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
@@ -360,7 +374,11 @@ app.post('/create-payment', async (req, res) => {
       const timeoutId = setTimeout(() => controller.abort(), 25000);
       fusionRes = await fetch(FUSION_API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'User-Agent': 'DaloaMarket-Server/1.0'
+        },
         body: JSON.stringify(fusionPayload),
         signal: controller.signal,
       });
@@ -421,7 +439,12 @@ app.post('/payment-webhook', async (req, res) => {
     const token = isOrder ? tx.payment_reference : tx.provider_token;
     if (!token) return res.status(400).json({ ok: false, message: 'Token absent' });
 
-    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${token}`);
+    const fusionRes = await fetch(`https://www.pay.moneyfusion.net/paiementNotif/${token}`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DaloaMarket-Server/1.0'
+      }
+    });
     const fusionData = await fusionRes.json().catch(() => null);
 
     if (!fusionData || fusionData.statut !== true || !fusionData.data) {
