@@ -151,7 +151,7 @@ app.get('/check-payment', async (req, res) => {
             await supabase.from('delivery_assignments').insert({
               order_id: escrow.order_id,
               delivery_person_id: null,
-              status: 'awaiting_pickup',
+              status: 'pending_seller_confirmation',
               pickup_confirmed_by_seller: false,
               pickup_otp: pickupOTP,
               delivery_otp: deliveryOTP,
@@ -496,7 +496,7 @@ app.post('/payment-webhook', async (req, res) => {
         await supabase.from('delivery_assignments').insert({
           order_id: tx.order_id,
           delivery_person_id: null,
-          status: 'awaiting_pickup',
+          status: 'pending_seller_confirmation',
           pickup_confirmed_by_seller: false,
           pickup_confirmed_at: null,
           pickup_otp: pickupOTP,
