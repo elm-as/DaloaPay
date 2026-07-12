@@ -297,6 +297,7 @@ app.post('/create-payment', async (req, res) => {
     });
 
     let transactionId = '';
+    let realOrderId = '';
     let finalAmount = amount;
     
     if (type === 'order') {
@@ -316,11 +317,33 @@ app.post('/create-payment', async (req, res) => {
       const commission = Math.round(listing.price * PRICING.PLATFORM_FEE_RATE);
       finalAmount = listing.price + deliveryFee + commission;
       
+      // 1.5 Créer l'order
+      const { data: order, error: orderErr } = await supabase
+        .from('orders')
+        .insert({
+          buyer_id: userId,
+          seller_id: listing.user_id,
+          listing_id: orderInput.listing_id,
+          product_amount: listing.price,
+          delivery_fee: deliveryFee,
+          total_amount: finalAmount,
+          delivery_address: orderInput.delivery_address || 'Daloa',
+          delivery_mode: orderInput.delivery_mode || 'delivery',
+          status: 'pending'
+        })
+        .select('id')
+        .single();
+
+      if (orderErr || !order) {
+        console.error('Order creation error:', orderErr);
+        return res.status(500).json({ success: false, message: 'Erreur création order' });
+      }
+
       // 2. Créer l'escrow_transaction
       const { data: escrow, error: escrowErr } = await supabase
         .from('escrow_transactions')
         .insert({
-          order_id: require('crypto').randomUUID(),
+          order_id: order.id,
           buyer_id: userId,
           seller_id: listing.user_id,
           total_amount: finalAmount,
@@ -338,6 +361,7 @@ app.post('/create-payment', async (req, res) => {
         return res.status(500).json({ success: false, message: 'Erreur création escrow' });
       }
       transactionId = escrow.id;
+      realOrderId = order.id;
 
     } else {
       if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Montant invalide.' });
@@ -352,7 +376,7 @@ app.post('/create-payment', async (req, res) => {
     }
 
     const baseUrl = SITE_URL.replace(/\/$/, '');
-    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${type === 'order' ? '&order_id=' + transactionId : ''}`;
+    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${type === 'order' ? '&order_id=' + realOrderId : ''}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
     const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)', listing_pack_10: 'Pack 10 annonces (500 FCFA)', order: 'Achat de produit sur DaloaMarket' };
@@ -399,7 +423,7 @@ app.post('/create-payment', async (req, res) => {
     // Sauvegarder le token
     if (type === 'order') {
       await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
-      return res.json({ success: true, order_id: transactionId, token: fusionData.token, payment_url: fusionData.url });
+      return res.json({ success: true, order_id: realOrderId, token: fusionData.token, payment_url: fusionData.url });
     } else {
       await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
       return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: fusionData.url });
