@@ -33,6 +33,75 @@ const PRICING = {
   PLATFORM_FEE_RATE: 0.06
 };
 
+// --- Helpers ---
+const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+
+/**
+ * Crée l'order + delivery_assignment UNIQUEMENT quand le paiement est confirmé.
+ * Idempotent : si l'escrow a déjà un order_id, on ne recrée pas.
+ * @returns {string} order_id
+ */
+async function createOrderFromEscrow(supabase, escrow, personalInfo) {
+  // Idempotence : si l'order existe déjà, on retourne directement
+  if (escrow.order_id) {
+    return escrow.order_id;
+  }
+
+  const meta = escrow.order_metadata || {};
+
+  // Créer l'order
+  const { data: order, error: orderErr } = await supabase
+    .from('orders')
+    .insert({
+      buyer_id: escrow.buyer_id,
+      seller_id: escrow.seller_id,
+      listing_id: meta.listing_id,
+      product_amount: meta.product_amount || (escrow.total_amount - escrow.delivery_fee - escrow.platform_fee),
+      delivery_fee: escrow.delivery_fee,
+      platform_commission: escrow.platform_fee,
+      total_amount: escrow.total_amount,
+      delivery_address: meta.delivery_address || personalInfo?.delivery_address || 'Daloa',
+      delivery_mode: meta.delivery_mode || personalInfo?.delivery_mode || 'delivery',
+      status: 'paid'  // ← directement "paid" puisque le paiement est confirmé
+    })
+    .select('id')
+    .single();
+
+  if (orderErr || !order) {
+    console.error('Order creation error:', orderErr);
+    throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
+  }
+
+  // Lier l'escrow à l'order
+  await supabase
+    .from('escrow_transactions')
+    .update({ order_id: order.id, status: 'funded', funded_at: new Date().toISOString() })
+    .eq('id', escrow.id);
+
+  // Créer delivery_assignment
+  const pickupOTP = generateOTP();
+  const deliveryOTP = generateOTP();
+  const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
+  const deliveryLat = meta.delivery_lat || personalInfo?.delivery_lat || null;
+  const deliveryLng = meta.delivery_lng || personalInfo?.delivery_lng || null;
+
+  await supabase.from('delivery_assignments').insert({
+    order_id: order.id,
+    delivery_person_id: null,
+    status: 'pending_seller_confirmation',
+    pickup_confirmed_by_seller: false,
+    pickup_otp: pickupOTP,
+    delivery_otp: deliveryOTP,
+    pickup_otp_attempts: 0,
+    delivery_otp_attempts: 0,
+    delivery_address: address,
+    delivery_lat: deliveryLat,
+    delivery_lng: deliveryLng,
+  });
+
+  return order.id;
+}
+
 app.get('/', (req, res) => {
   res.json({ ok: true, message: 'DaloaMarket Payment API' });
 });
@@ -110,12 +179,13 @@ app.get('/check-payment', async (req, res) => {
     }
 
     if (escrow) {
-      // Si déjà payé, renvoyer directement
+      // Si déjà payé (funded/released), renvoyer directement
       if (escrow.status !== 'pending') {
         return res.json({
           success: true,
           status: statusMap[escrow.status] || 'unknown',
           transactionId: escrow.id,
+          order_id: escrow.order_id || null,
           amount: escrow.total_amount,
           paymentMethod: escrow.payment_method,
           confirmedAt: escrow.funded_at,
@@ -136,38 +206,18 @@ app.get('/check-payment', async (req, res) => {
           const fusionData = await fusionRes.json().catch(() => null);
 
           if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
-            // Le paiement est bien fait → mettre à jour la DB
-            await supabase
-              .from('escrow_transactions')
-              .update({ status: 'funded', funded_at: new Date().toISOString() })
-              .eq('id', escrow.id);
-
-            // Même logique que le webhook : créer delivery_assignments, etc.
-            console.log('check-payment: payment confirmed, triggering delivery flow...');
-            const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
-            const pickupOTP = generateOTP();
-            const deliveryOTP = generateOTP();
-
-            await supabase.from('delivery_assignments').insert({
-              order_id: escrow.order_id,
-              delivery_person_id: null,
-              status: 'pending_seller_confirmation',
-              pickup_confirmed_by_seller: false,
-              pickup_otp: pickupOTP,
-              delivery_otp: deliveryOTP,
-              pickup_otp_attempts: 0,
-              delivery_otp_attempts: 0,
-            });
-
-            await supabase.from('orders').update({ status: 'paid' }).eq('id', escrow.order_id);
+            // ✅ Paiement confirmé → MAINTENANT on crée l'order
+            console.log('check-payment: payment confirmed, creating order...');
+            const orderId = await createOrderFromEscrow(supabase, escrow, null);
 
             return res.json({
               success: true,
               status: 'paid',
               transactionId: escrow.id,
+              order_id: orderId,
               amount: escrow.total_amount,
               paymentMethod: escrow.payment_method,
-              confirmedAt: escrow.funded_at,
+              confirmedAt: new Date().toISOString(),
             });
           }
 
@@ -180,7 +230,6 @@ app.get('/check-payment', async (req, res) => {
           }
         } catch (fusionErr) {
           console.log('check-payment: MoneyFusion check failed, will retry later:', fusionErr.message);
-          // Money Fusion injoignable → on laisse pending, le frontend pourra réessayer
         }
       }
 
@@ -282,6 +331,9 @@ app.get('/check-payment', async (req, res) => {
 });
 
 // 1) Créer un paiement
+// Pour les commandes (type='order'), on NE CRÉE PAS l'order en DB.
+// On crée uniquement l'escrow_transaction comme "intention de paiement".
+// L'order ne sera créé que quand Money Fusion confirme le paiement.
 app.post('/create-payment', async (req, res) => {
   console.log('POST /create-payment received', req.body);
   try {
@@ -297,7 +349,6 @@ app.post('/create-payment', async (req, res) => {
     });
 
     let transactionId = '';
-    let realOrderId = '';
     let finalAmount = amount;
     
     if (type === 'order') {
@@ -317,34 +368,12 @@ app.post('/create-payment', async (req, res) => {
       const commission = Math.round(listing.price * PRICING.PLATFORM_FEE_RATE);
       finalAmount = listing.price + deliveryFee + commission;
       
-      // 1.5 Créer l'order
-      const { data: order, error: orderErr } = await supabase
-        .from('orders')
-        .insert({
-          buyer_id: userId,
-          seller_id: listing.user_id,
-          listing_id: orderInput.listing_id,
-          product_amount: listing.price,
-          delivery_fee: deliveryFee,
-          platform_commission: commission,
-          total_amount: finalAmount,
-          delivery_address: orderInput.delivery_address || 'Daloa',
-          delivery_mode: orderInput.delivery_mode || 'delivery',
-          status: 'pending'
-        })
-        .select('id')
-        .single();
-
-      if (orderErr || !order) {
-        console.error('Order creation error:', orderErr);
-        return res.status(500).json({ success: false, message: 'Erreur création order: ' + (orderErr?.message || 'unknown') });
-      }
-
-      // 2. Créer l'escrow_transaction
+      // 2. Créer UNIQUEMENT l'escrow_transaction (PAS d'order)
+      // L'escrow stocke les métadonnées nécessaires pour créer l'order plus tard
       const { data: escrow, error: escrowErr } = await supabase
         .from('escrow_transactions')
         .insert({
-          order_id: order.id,
+          order_id: null,  // ← PAS d'order pour l'instant
           buyer_id: userId,
           seller_id: listing.user_id,
           total_amount: finalAmount,
@@ -352,7 +381,15 @@ app.post('/create-payment', async (req, res) => {
           delivery_fee: deliveryFee,
           platform_fee: commission,
           status: 'pending',
-          payment_method: 'mobile_money'
+          payment_method: 'mobile_money',
+          order_metadata: {
+            listing_id: orderInput.listing_id,
+            product_amount: listing.price,
+            delivery_address: orderInput.delivery_address || 'Daloa',
+            delivery_mode: orderInput.delivery_mode || 'delivery',
+            delivery_lat: orderInput.delivery_lat || null,
+            delivery_lng: orderInput.delivery_lng || null,
+          }
         })
         .select('id')
         .single();
@@ -362,7 +399,6 @@ app.post('/create-payment', async (req, res) => {
         return res.status(500).json({ success: false, message: 'Erreur création escrow' });
       }
       transactionId = escrow.id;
-      realOrderId = order.id;
 
     } else {
       if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Montant invalide.' });
@@ -377,7 +413,8 @@ app.post('/create-payment', async (req, res) => {
     }
 
     const baseUrl = SITE_URL.replace(/\/$/, '');
-    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${type === 'order' ? '&order_id=' + realOrderId : ''}`;
+    // Pour les orders, on ne passe plus order_id dans l'URL (il n'existe pas encore)
+    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
     const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)', listing_pack_10: 'Pack 10 annonces (500 FCFA)', order: 'Achat de produit sur DaloaMarket' };
@@ -424,7 +461,8 @@ app.post('/create-payment', async (req, res) => {
     // Sauvegarder le token
     if (type === 'order') {
       await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
-      return res.json({ success: true, order_id: realOrderId, token: fusionData.token, payment_url: fusionData.url });
+      // On ne renvoie PAS d'order_id (il n'existe pas encore)
+      return res.json({ success: true, token: fusionData.token, payment_url: fusionData.url, transactionId });
     } else {
       await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
       return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: fusionData.url });
@@ -456,7 +494,7 @@ app.post('/payment-webhook', async (req, res) => {
     const { data: tx, error } = await supabase.from(table).select('*').eq('id', transactionId).maybeSingle();
     if (error || !tx) return res.status(404).json({ ok: false, message: 'Transaction introuvable' });
 
-    // Verif statut DB
+    // Verif statut DB (idempotence)
     if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
       return res.json({ ok: true, message: 'Déjà confirmée' });
     }
@@ -480,45 +518,9 @@ app.post('/payment-webhook', async (req, res) => {
 
     if (fusionStatus === 'paid') {
       if (isOrder) {
-        // Validation commande : escrow = funded
-        await supabase.from('escrow_transactions').update({ status: 'funded', funded_at: new Date().toISOString() }).eq('id', transactionId);
-
-        // Générer deux OTP distincts (6 chiffres chacun)
-        const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
-        const pickupOTP = generateOTP();
-        const deliveryOTP = generateOTP();
-
-        // Créer l'assignation de livraison avec les deux OTP
-        const address = personal.delivery_address || 'Daloa';
-        const deliveryLat = personal.delivery_lat || null;
-        const deliveryLng = personal.delivery_lng || null;
-
-        await supabase.from('delivery_assignments').insert({
-          order_id: tx.order_id,
-          delivery_person_id: null,
-          status: 'pending_seller_confirmation',
-          pickup_confirmed_by_seller: false,
-          pickup_confirmed_at: null,
-          pickup_otp: pickupOTP,
-          delivery_otp: deliveryOTP,
-          pickup_otp_attempts: 0,
-          delivery_otp_attempts: 0,
-          accepted_at: null,
-          delivery_address: address,
-          delivery_lat: deliveryLat,
-          delivery_lng: deliveryLng,
-          pickup_gps: null,
-          pickup_gps_distance_m: null,
-          delivery_gps: null,
-          delivery_gps_distance_m: null,
-          pickup_photo_url: null,
-          delivered_at: null,
-          buyer_confirmed_at: null,
-          auto_released_at: null
-        });
-
-        // Mettre à jour le statut de la commande
-        await supabase.from('orders').update({ status: 'paid' }).eq('id', tx.order_id);
+        // ✅ Paiement confirmé → MAINTENANT on crée l'order
+        console.log('webhook: payment confirmed, creating order...');
+        await createOrderFromEscrow(supabase, tx, personal);
       } else {
         const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
         if (rpcByType[type]) {
@@ -539,6 +541,76 @@ app.post('/payment-webhook', async (req, res) => {
     return res.json({ ok: true, status: 'pending' });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+// 3) Webhook de traitement des Payouts (peut être appelé par un cron)
+app.get('/process-payouts', async (req, res) => {
+  try {
+    checkConfig();
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: payouts, error } = await supabase
+      .from('payouts')
+      .select('*')
+      .eq('status', 'pending');
+
+    if (error) throw error;
+    if (!payouts || payouts.length === 0) {
+      return res.json({ success: true, message: 'Aucun payout en attente', processed: 0 });
+    }
+
+    const results = [];
+    // On utilise la clé privée configurée en variable d'environnement
+    const MONEYFUSION_PRIVATE_KEY = process.env.MONEYFUSION_PRIVATE_KEY;
+
+    if (!MONEYFUSION_PRIVATE_KEY) {
+      return res.status(500).json({ success: false, message: 'La clé privée MONEYFUSION_PRIVATE_KEY est manquante dans les variables d\'environnement du serveur.' });
+    }
+
+    for (const payout of payouts) {
+      if (!payout.withdraw_mode) {
+        results.push({ id: payout.id, status: 'skipped', reason: 'withdraw_mode manquant' });
+        continue;
+      }
+
+      try {
+        const payload = {
+          countryCode: "ci",
+          phone: payout.recipient_phone.replace(/\s/g, '').replace(/^\+225/, ''),
+          amount: payout.amount,
+          withdraw_mode: payout.withdraw_mode
+        };
+
+        const response = await fetch('https://pay.moneyfusion.net/api/v1/withdraw', {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "moneyfusion-private-key": MONEYFUSION_PRIVATE_KEY,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const result = await response.json();
+
+        if (result.statut === true) {
+          await supabase.from('payouts').update({ status: 'processing', provider_token: result.tokenPay, updated_at: new Date().toISOString() }).eq('id', payout.id);
+          results.push({ id: payout.id, status: 'processing', token: result.tokenPay });
+        } else {
+          await supabase.from('payouts').update({ status: 'failed', failure_reason: result.message || 'Erreur API MoneyFusion', updated_at: new Date().toISOString() }).eq('id', payout.id);
+          results.push({ id: payout.id, status: 'failed', reason: result.message });
+        }
+      } catch (err) {
+        await supabase.from('payouts').update({ status: 'failed', failure_reason: err.message || 'Exception réseau', updated_at: new Date().toISOString() }).eq('id', payout.id);
+        results.push({ id: payout.id, status: 'failed', reason: err.message });
+      }
+    }
+
+    return res.json({ success: true, processed: payouts.length, results });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
   }
 });
 
