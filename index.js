@@ -544,6 +544,9 @@ app.post('/payment-webhook', async (req, res) => {
   }
 });
 
+// Variable globale pour éviter les appels concurrents sur le même payout
+const processingPayouts = new Set();
+
 // 3) Webhook de traitement des Payouts (peut être appelé par un cron)
 app.get('/process-payouts', async (req, res) => {
   try {
@@ -571,8 +574,16 @@ app.get('/process-payouts', async (req, res) => {
     }
 
     for (const payout of payouts) {
+      // Protection anti double-processing
+      if (processingPayouts.has(payout.id)) {
+        results.push({ id: payout.id, status: 'skipped', reason: 'already processing' });
+        continue;
+      }
+      processingPayouts.add(payout.id);
+
       if (!payout.withdraw_mode) {
         results.push({ id: payout.id, status: 'skipped', reason: 'withdraw_mode manquant' });
+        processingPayouts.delete(payout.id);
         continue;
       }
 
@@ -581,7 +592,8 @@ app.get('/process-payouts', async (req, res) => {
           countryCode: "ci",
           phone: payout.recipient_phone.replace(/\s/g, '').replace(/^\+225/, ''),
           amount: payout.amount,
-          withdraw_mode: payout.withdraw_mode
+          withdraw_mode: payout.withdraw_mode,
+          webhook_url: `${req.protocol}://${req.get('host')}/payout-webhook`
         };
 
         const response = await fetch('https://pay.moneyfusion.net/api/v1/withdraw', {
@@ -605,12 +617,38 @@ app.get('/process-payouts', async (req, res) => {
       } catch (err) {
         await supabase.from('payouts').update({ status: 'failed', failure_reason: err.message || 'Exception réseau', updated_at: new Date().toISOString() }).eq('id', payout.id);
         results.push({ id: payout.id, status: 'failed', reason: err.message });
+      } finally {
+        processingPayouts.delete(payout.id);
       }
     }
 
     return res.json({ success: true, processed: payouts.length, results });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// 4) Webhook pour le résultat des Payouts
+app.post('/payout-webhook', async (req, res) => {
+  try {
+    checkConfig();
+    const { event, tokenPay, message } = req.body;
+    
+    if (!tokenPay) return res.status(400).json({ ok: false, message: 'Token absent' });
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    if (event === "payout.session.completed") {
+      await supabase.from('payouts').update({ status: 'paid', updated_at: new Date().toISOString() }).eq('provider_token', tokenPay);
+    } else if (event === "payout.session.cancelled") {
+      await supabase.from('payouts').update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion', updated_at: new Date().toISOString() }).eq('provider_token', tokenPay);
+    }
+    
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
