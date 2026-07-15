@@ -608,16 +608,16 @@ app.get('/process-payouts', async (req, res) => {
         const result = await response.json();
 
         if (result.statut === true) {
-          const { error: updateErr } = await supabase.from('payouts').update({ status: 'processing', provider_token: result.tokenPay, updated_at: new Date().toISOString() }).eq('id', payout.id);
+          const { error: updateErr } = await supabase.from('payouts').update({ status: 'processing', provider_token: result.tokenPay }).eq('id', payout.id);
           if (updateErr) throw new Error('Erreur DB update: ' + updateErr.message);
           results.push({ id: payout.id, status: 'processing', token: result.tokenPay });
         } else {
-          const { error: updateErr } = await supabase.from('payouts').update({ status: 'failed', failure_reason: result.message || 'Erreur API MoneyFusion', updated_at: new Date().toISOString() }).eq('id', payout.id);
+          const { error: updateErr } = await supabase.from('payouts').update({ status: 'failed', failure_reason: result.message || 'Erreur API MoneyFusion' }).eq('id', payout.id);
           if (updateErr) throw new Error('Erreur DB update failed: ' + updateErr.message);
           results.push({ id: payout.id, status: 'failed', reason: result.message });
         }
       } catch (err) {
-        const { error: updateErr } = await supabase.from('payouts').update({ status: 'failed', failure_reason: err.message || 'Exception réseau', updated_at: new Date().toISOString() }).eq('id', payout.id);
+        const { error: updateErr } = await supabase.from('payouts').update({ status: 'failed', failure_reason: err.message || 'Exception réseau' }).eq('id', payout.id);
         results.push({ id: payout.id, status: 'failed', reason: err.message });
       } finally {
         processingPayouts.delete(payout.id);
@@ -643,9 +643,9 @@ app.post('/payout-webhook', async (req, res) => {
     });
 
     if (event === "payout.session.completed") {
-      await supabase.from('payouts').update({ status: 'paid', updated_at: new Date().toISOString() }).eq('provider_token', tokenPay);
+      await supabase.from('payouts').update({ status: 'paid', completed_at: new Date().toISOString() }).eq('provider_token', tokenPay);
     } else if (event === "payout.session.cancelled") {
-      await supabase.from('payouts').update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion', updated_at: new Date().toISOString() }).eq('provider_token', tokenPay);
+      await supabase.from('payouts').update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion' }).eq('provider_token', tokenPay);
     }
     
     return res.json({ ok: true });
