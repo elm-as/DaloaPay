@@ -30,7 +30,9 @@ function checkConfig() {
 const PRICING = {
   DELIVERY_MIN: 500,
   DELIVERY_RATE_PER_KM: 200,
-  PLATFORM_FEE_RATE: 0.06
+  BUYER_FEE_RATE: 0.03,
+  SELLER_FEE_RATE: 0.03,
+  DRIVER_FEE_RATE: 0.10
 };
 
 // --- Helpers ---
