@@ -367,7 +367,8 @@ app.post('/create-payment', async (req, res) => {
       }
       
       const deliveryFee = PRICING.DELIVERY_MIN;
-      const commission = Math.round(listing.price * PRICING.PLATFORM_FEE_RATE);
+      const commission = Math.round(listing.price * PRICING.BUYER_FEE_RATE);
+      const sellerCommission = Math.round(listing.price * PRICING.SELLER_FEE_RATE);
       finalAmount = listing.price + deliveryFee + commission;
       
       // 2. Créer UNIQUEMENT l'escrow_transaction (PAS d'order)
@@ -379,7 +380,7 @@ app.post('/create-payment', async (req, res) => {
           buyer_id: userId,
           seller_id: listing.user_id,
           total_amount: finalAmount,
-          seller_amount: listing.price - commission,
+          seller_amount: listing.price - sellerCommission,
           delivery_fee: deliveryFee,
           platform_fee: commission,
           status: 'pending',
