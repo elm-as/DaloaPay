@@ -663,12 +663,14 @@ app.get('/process-payouts', async (req, res) => {
       }
 
       try {
+        const host = req.get('host');
+        const protocol = host.includes('localhost') || host.includes('127.0.0.1') ? 'http' : 'https';
         const payload = {
           countryCode: "ci",
           phone: payout.recipient_phone.replace(/\s/g, '').replace(/^\+225/, ''),
           amount: payout.amount,
           withdraw_mode: payout.withdraw_mode,
-          webhook_url: `${req.protocol}://${req.get('host')}/payout-webhook`
+          webhook_url: `${protocol}://${host}/payout-webhook`
         };
 
         const response = await fetch('https://pay.moneyfusion.net/api/v1/withdraw', {
@@ -707,24 +709,49 @@ app.get('/process-payouts', async (req, res) => {
 
 // 4) Webhook pour le résultat des Payouts
 app.post('/payout-webhook', async (req, res) => {
+  console.log('[Webhook Payout Received] Payload:', JSON.stringify(req.body));
   try {
     checkConfig();
     const { event, tokenPay, message } = req.body;
     
-    if (!tokenPay) return res.status(400).json({ ok: false, message: 'Token absent' });
+    if (!tokenPay) {
+      console.warn('[Webhook Payout Warning] Token is missing');
+      return res.status(400).json({ ok: false, message: 'Token absent' });
+    }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
     if (event === "payout.session.completed") {
-      await supabase.from('payouts').update({ status: 'paid', completed_at: new Date().toISOString() }).eq('provider_token', tokenPay);
+      console.log(`[Webhook Payout Success] Updating payout for token: ${tokenPay} to status 'paid'`);
+      const { error } = await supabase
+        .from('payouts')
+        .update({ status: 'paid', completed_at: new Date().toISOString() })
+        .eq('provider_token', tokenPay);
+      if (error) {
+        console.error('[Webhook Payout Error] Database update failed:', error);
+      } else {
+        console.log('[Webhook Payout Success] Database updated successfully.');
+      }
     } else if (event === "payout.session.cancelled") {
-      await supabase.from('payouts').update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion' }).eq('provider_token', tokenPay);
+      console.log(`[Webhook Payout Cancelled] Updating payout for token: ${tokenPay} to status 'failed'`);
+      const { error } = await supabase
+        .from('payouts')
+        .update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion' })
+        .eq('provider_token', tokenPay);
+      if (error) {
+        console.error('[Webhook Payout Error] Database update failed:', error);
+      } else {
+        console.log('[Webhook Payout Cancelled] Database updated successfully.');
+      }
+    } else {
+      console.warn('[Webhook Payout Warning] Unknown event type:', event);
     }
     
     return res.json({ ok: true });
   } catch (e) {
+    console.error('[Webhook Payout Exception]:', e);
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
