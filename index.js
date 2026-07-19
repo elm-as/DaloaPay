@@ -31,9 +31,33 @@ const PRICING = {
   DELIVERY_MIN: 500,
   DELIVERY_RATE_PER_KM: 200,
   BUYER_FEE_RATE: 0.03,
-  SELLER_FEE_RATE: 0.03,
+  SELLER_FEE_RATE: 0.035,
   DRIVER_FEE_RATE: 0.10
 };
+
+// --- Distance Calculation (Haversine) ---
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth radius in km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function calculateDeliveryFee(distanceKm) {
+  const baseFee = PRICING.DELIVERY_MIN;
+  let extraFee = 0;
+  if (distanceKm > 1) {
+    extraFee = Math.round((distanceKm - 1) * PRICING.DELIVERY_RATE_PER_KM);
+  }
+  return baseFee + extraFee;
+}
 
 // --- Helpers ---
 const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
@@ -86,6 +110,7 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
   const deliveryLat = meta.delivery_lat || personalInfo?.delivery_lat || null;
   const deliveryLng = meta.delivery_lng || personalInfo?.delivery_lng || null;
+  const distanceKm = meta.distance_km || null;
 
   await supabase.from('delivery_assignments').insert({
     order_id: order.id,
@@ -99,6 +124,7 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
     delivery_address: address,
     delivery_lat: deliveryLat,
     delivery_lng: deliveryLng,
+    delivery_price: escrow.delivery_fee,
   });
 
   return order.id;
@@ -290,6 +316,12 @@ app.get('/check-payment', async (req, res) => {
               await supabase.rpc(rpcByType[tx.type], { p_transaction_id: tx.id });
             } else if (tx.type === 'listing_pack_10') {
               await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 10 });
+            } else if (tx.type === 'credits_pack_5') {
+              await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 5 });
+            } else if (tx.type === 'credits_pack_12') {
+              await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 12 });
+            } else if (tx.type === 'credits_pack_30') {
+              await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 30 });
             }
             await supabase
               .from('monetization_transactions')
@@ -342,7 +374,8 @@ app.post('/create-payment', async (req, res) => {
     checkConfig();
     const { type, amount, customerName, customerPhone, userId, metadata, orderInput } = req.body;
     
-    if (!type || !['seller_badge', 'listing_pack_10', 'order'].includes(type)) {
+    const allowedTypes = ['seller_badge', 'listing_pack_10', 'order', 'credits_pack_5', 'credits_pack_12', 'credits_pack_30'];
+    if (!type || !allowedTypes.includes(type)) {
       return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
     }
 
@@ -354,7 +387,7 @@ app.post('/create-payment', async (req, res) => {
     let finalAmount = amount;
     
     if (type === 'order') {
-      // 1. Lire la db pour le prix de l'article
+      // 1. Lire la db pour le prix de l'article + coordonnées vendeur
       const { data: listing, error: listingErr } = await supabase
         .from('listings')
         .select('price, user_id')
@@ -366,10 +399,33 @@ app.post('/create-payment', async (req, res) => {
         return res.status(404).json({ success: false, message: 'Article introuvable' });
       }
       
-      const deliveryFee = PRICING.DELIVERY_MIN;
+      // Récupérer le profil du vendeur (statut PRO + coordonnées boutique)
+      const { data: sellerProfile } = await supabase
+        .from('users')
+        .select('pro_until, shop_latitude, shop_longitude')
+        .eq('id', listing.user_id)
+        .single();
+        
+      const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
+      const sellerFeeRate = isProSeller ? 0.025 : PRICING.SELLER_FEE_RATE;
+      
+      // Calcul dynamique de la distance et des frais de livraison
+      const deliveryLat = orderInput.delivery_lat || null;
+      const deliveryLng = orderInput.delivery_lng || null;
+      const sellerLat = sellerProfile?.shop_latitude || null;
+      const sellerLng = sellerProfile?.shop_longitude || null;
+      
+      let distanceKm = 0;
+      if (deliveryLat != null && deliveryLng != null && sellerLat != null && sellerLng != null) {
+        distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
+      }
+      
+      const deliveryFee = calculateDeliveryFee(distanceKm);
       const commission = Math.round(listing.price * PRICING.BUYER_FEE_RATE);
-      const sellerCommission = Math.round(listing.price * PRICING.SELLER_FEE_RATE);
+      const sellerCommission = Math.round(listing.price * sellerFeeRate);
       finalAmount = listing.price + deliveryFee + commission;
+      
+      console.log(`Order pricing: distance=${distanceKm.toFixed(1)}km, deliveryFee=${deliveryFee}F, total=${finalAmount}F`);
       
       // 2. Créer UNIQUEMENT l'escrow_transaction (PAS d'order)
       // L'escrow stocke les métadonnées nécessaires pour créer l'order plus tard
@@ -390,8 +446,10 @@ app.post('/create-payment', async (req, res) => {
             product_amount: listing.price,
             delivery_address: orderInput.delivery_address || 'Daloa',
             delivery_mode: orderInput.delivery_mode || 'delivery',
-            delivery_lat: orderInput.delivery_lat || null,
-            delivery_lng: orderInput.delivery_lng || null,
+            delivery_lat: deliveryLat,
+            delivery_lng: deliveryLng,
+            distance_km: Math.round(distanceKm * 10) / 10,
+            delivery_fee_calculated: deliveryFee,
           }
         })
         .select('id')
@@ -420,7 +478,14 @@ app.post('/create-payment', async (req, res) => {
     const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
-    const labelByType = { seller_badge: 'Badge Vendeur Pro (30 jours)', listing_pack_10: 'Pack 10 annonces (500 FCFA)', order: 'Achat de produit sur DaloaMarket' };
+    const labelByType = { 
+      seller_badge: 'Badge Vendeur Pro (30 jours)', 
+      listing_pack_10: 'Pack 10 annonces (500 FCFA)', 
+      order: 'Achat de produit sur DaloaMarket',
+      credits_pack_5: 'Pack Bronze (5 crédits)',
+      credits_pack_12: 'Pack Argent (12 crédits)',
+      credits_pack_30: 'Pack Or (30 crédits)'
+    };
     const fusionPayload = {
       totalPrice: Math.round(finalAmount),
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
@@ -530,6 +595,12 @@ app.post('/payment-webhook', async (req, res) => {
           await supabase.rpc(rpcByType[type], { p_transaction_id: transactionId });
         } else if (type === 'listing_pack_10') {
           await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 10 });
+        } else if (type === 'credits_pack_5') {
+          await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 5 });
+        } else if (type === 'credits_pack_12') {
+          await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 12 });
+        } else if (type === 'credits_pack_30') {
+          await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: 30 });
         }
         await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', transactionId);
       }
@@ -561,7 +632,8 @@ app.get('/process-payouts', async (req, res) => {
     const { data: payouts, error } = await supabase
       .from('payouts')
       .select('*')
-      .eq('status', 'pending');
+      .eq('status', 'pending')
+      .lte('scheduled_for', new Date().toISOString());
 
     if (error) throw error;
     if (!payouts || payouts.length === 0) {
