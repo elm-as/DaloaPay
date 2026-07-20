@@ -629,15 +629,20 @@ app.get('/process-payouts', async (req, res) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const { data: payouts, error } = await supabase
+    let query = supabase
       .from('payouts')
       .select('*')
-      .eq('status', 'pending')
-      .lte('scheduled_for', new Date().toISOString());
+      .eq('status', 'pending');
+
+    if (req.query.force !== 'true') {
+      query = query.lte('scheduled_for', new Date().toISOString());
+    }
+
+    const { data: payouts, error } = await query;
 
     if (error) throw error;
     if (!payouts || payouts.length === 0) {
-      return res.json({ success: true, message: 'Aucun payout en attente', processed: 0 });
+      return res.json({ success: true, message: req.query.force === 'true' ? 'Aucun payout de statut pending' : 'Aucun payout en attente (délai d\'escrow non expiré)', processed: 0 });
     }
 
     const results = [];
