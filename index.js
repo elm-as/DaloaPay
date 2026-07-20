@@ -730,25 +730,69 @@ app.post('/payout-webhook', async (req, res) => {
 
     if (event === "payout.session.completed") {
       console.log(`[Webhook Payout Success] Updating payout for token: ${tokenPay} to status 'paid'`);
-      const { error } = await supabase
-        .from('payouts')
-        .update({ status: 'paid', completed_at: new Date().toISOString() })
-        .eq('provider_token', tokenPay);
-      if (error) {
-        console.error('[Webhook Payout Error] Database update failed:', error);
-      } else {
+      
+      let updatedRows = null;
+      let attempts = 0;
+      
+      while (attempts < 5) {
+        const { data, error } = await supabase
+          .from('payouts')
+          .update({ status: 'paid', completed_at: new Date().toISOString() })
+          .eq('provider_token', tokenPay)
+          .select();
+          
+        if (error) {
+          console.error('[Webhook Payout Error] Database update failed:', error);
+          break;
+        }
+        
+        if (data && data.length > 0) {
+          updatedRows = data;
+          break;
+        }
+        
+        attempts++;
+        console.log(`[Webhook Payout Success] Payout row not found/updated yet (attempt ${attempts}/5). Retrying in 2s...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      
+      if (updatedRows) {
         console.log('[Webhook Payout Success] Database updated successfully.');
+      } else {
+        console.warn('[Webhook Payout Warning] Payout row was NOT updated (not found after 5 attempts).');
       }
     } else if (event === "payout.session.cancelled") {
       console.log(`[Webhook Payout Cancelled] Updating payout for token: ${tokenPay} to status 'failed'`);
-      const { error } = await supabase
-        .from('payouts')
-        .update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion' })
-        .eq('provider_token', tokenPay);
-      if (error) {
-        console.error('[Webhook Payout Error] Database update failed:', error);
-      } else {
+      
+      let updatedRows = null;
+      let attempts = 0;
+      
+      while (attempts < 5) {
+        const { data, error } = await supabase
+          .from('payouts')
+          .update({ status: 'failed', failure_reason: message || 'Annulé par MoneyFusion' })
+          .eq('provider_token', tokenPay)
+          .select();
+          
+        if (error) {
+          console.error('[Webhook Payout Error] Database update failed:', error);
+          break;
+        }
+        
+        if (data && data.length > 0) {
+          updatedRows = data;
+          break;
+        }
+        
+        attempts++;
+        console.log(`[Webhook Payout Cancelled] Payout row not found/updated yet (attempt ${attempts}/5). Retrying in 2s...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      
+      if (updatedRows) {
         console.log('[Webhook Payout Cancelled] Database updated successfully.');
+      } else {
+        console.warn('[Webhook Payout Warning] Payout row was NOT updated (not found after 5 attempts).');
       }
     } else {
       console.warn('[Webhook Payout Warning] Unknown event type:', event);
