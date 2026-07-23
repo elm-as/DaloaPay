@@ -1,14 +1,49 @@
-// Serveur Express pour Railway - API Paiement DaloaMarket
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const dns = require('dns');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 // Node 18+ fetch() préfère l'IPv6, ce qui fait planter les requêtes vers MoneyFusion sur Render
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
+
+// --- RATE LIMITERS ---
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requêtes par 15 min par IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Trop de requêtes globales. Veuillez patienter.' }
+});
+
+const createPaymentLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // Max 10 créations de paiement par minute par IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Trop d\'intentions de paiement générées. Veuillez patienter 1 minute.' }
+});
+
+const checkPaymentLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // Max 30 vérifications de paiement par minute par IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Trop de vérifications de statut de paiement.' }
+});
+
+const payoutLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // Max 5 appels de payout par minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Limite de traitement de payouts atteinte.' }
+});
+
+app.use(globalLimiter);
 app.use(cors());
 app.use(express.json());
 
@@ -167,7 +202,7 @@ app.get('/health', (req, res) => {
 
 // 0d) Vérifier le statut d'un paiement (appelé par PaymentReturnPage)
 // Si la DB est encore en "pending", on interroge Money Fusion directement
-app.get('/check-payment', async (req, res) => {
+app.get('/check-payment', checkPaymentLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -368,7 +403,7 @@ app.get('/check-payment', async (req, res) => {
 // Pour les commandes (type='order'), on NE CRÉE PAS l'order en DB.
 // On crée uniquement l'escrow_transaction comme "intention de paiement".
 // L'order ne sera créé que quand Money Fusion confirme le paiement.
-app.post('/create-payment', async (req, res) => {
+app.post('/create-payment', createPaymentLimiter, async (req, res) => {
   console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
@@ -382,6 +417,21 @@ app.post('/create-payment', async (req, res) => {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
+
+    // Check system_settings for emergency payment suspension / MoneyFusion crash fallback
+    const { data: sysSettings } = await supabase
+      .from('system_settings')
+      .select('value')
+      .eq('key', 'payment_settings')
+      .maybeSingle();
+
+    const payConfig = sysSettings?.value || {};
+    if (payConfig.disable_online_payments || payConfig.status === 'down') {
+      return res.status(503).json({
+        success: false,
+        message: payConfig.notice || 'Les paiements Mobile Money sont temporairement suspendus pour maintenance.'
+      });
+    }
 
     let transactionId = '';
     let finalAmount = amount;
@@ -622,7 +672,7 @@ app.post('/payment-webhook', async (req, res) => {
 const processingPayouts = new Set();
 
 // 3) Webhook de traitement des Payouts (peut être appelé par un cron)
-app.get('/process-payouts', async (req, res) => {
+app.get('/process-payouts', payoutLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
