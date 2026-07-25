@@ -47,6 +47,57 @@ app.use(globalLimiter);
 app.use(cors());
 app.use(express.json());
 
+// --- SEO BOT PRERENDER MIDDLEWARE ---
+const { isBot } = require('./seo/botDetector');
+const { renderCategoryPage } = require('./seo/marketPrerender');
+const { renderDriverProfile } = require('./seo/deliveryPrerender');
+
+// Middleware d'interception pour les robots (Googlebot, WhatsApp, Facebook, etc.)
+app.use(async (req, res, next) => {
+  const ua = req.get('user-agent');
+  if (!isBot(ua)) return next();
+
+  try {
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const path = req.path;
+
+    // 1. DaloaDelivery : Profil Livreur (/livreur/:id)
+    if (path.startsWith('/livreur/')) {
+      const driverId = path.split('/')[2];
+      if (driverId) {
+        const html = await renderDriverProfile(supabase, driverId);
+        return res.send(html);
+      }
+    }
+
+    // 2. DaloaMarket : Catégorie (/c/:slug ou /mode, /electronique, etc.)
+    let categorySlug = null;
+    if (path.startsWith('/c/')) {
+      categorySlug = path.split('/')[2];
+    } else {
+      const catRoutes = ['electronique', 'vehicules', 'mode', 'maison-deco', 'sports-loisirs', 'livres', 'alimentaire'];
+      const rawSlug = path.replace(/^\//, '').toLowerCase();
+      if (catRoutes.includes(rawSlug)) {
+        categorySlug = rawSlug;
+      } else if (req.query.category) {
+        categorySlug = req.query.category;
+      }
+    }
+
+    if (categorySlug) {
+      const html = await renderCategoryPage(supabase, categorySlug);
+      return res.send(html);
+    }
+  } catch (err) {
+    console.error('SEO Bot prerender error:', err);
+  }
+
+  next();
+});
+
 // Variables d'environnement (à configurer dans Railway)
 const FUSION_API_URL = process.env.FUSION_API_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
