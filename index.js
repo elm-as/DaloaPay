@@ -54,8 +54,11 @@ const { renderDriverProfile } = require('./seo/deliveryPrerender');
 
 // Middleware d'interception pour les robots (Googlebot, WhatsApp, Facebook, etc.)
 app.use(async (req, res, next) => {
-  const ua = req.get('user-agent');
-  if (!isBot(ua)) return next();
+  const ua = req.get('user-agent') || '';
+  const isBotDetected = isBot(ua);
+  console.log(`[SEO Prerender Check] Path: ${req.path} | IsBot: ${isBotDetected} | UA: ${ua.slice(0, 60)}`);
+
+  if (!isBotDetected) return next();
 
   try {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -73,9 +76,11 @@ app.use(async (req, res, next) => {
       }
     }
 
-    // 2. DaloaMarket : Catégorie (/c/:slug ou /mode, /electronique, etc.)
+    // 2. DaloaMarket : Catégorie (/c/:slug, /categorie/:slug ou /mode, /electronique, etc.)
     let categorySlug = null;
     if (path.startsWith('/c/')) {
+      categorySlug = path.split('/')[2];
+    } else if (path.startsWith('/categorie/')) {
       categorySlug = path.split('/')[2];
     } else {
       const catRoutes = ['electronique', 'vehicules', 'mode', 'maison-deco', 'sports-loisirs', 'livres', 'alimentaire'];
