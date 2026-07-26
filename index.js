@@ -120,7 +120,8 @@ function checkConfig() {
 // --- PRICING CONSTANTS (SYNC WITH src/lib/pricing.ts) ---
 const PRICING = {
   DELIVERY_MIN: 500,
-  DELIVERY_RATE_PER_KM: 200,
+  DELIVERY_RATE_PER_KM: 85,
+  DELIVERY_FREE_KM: 1.5,
   BUYER_FEE_RATE: 0.03,
   SELLER_FEE_RATE: 0.035,
   DRIVER_FEE_RATE: 0.10
@@ -144,8 +145,8 @@ function haversineDistance(lat1, lon1, lat2, lon2) {
 function calculateDeliveryFee(distanceKm) {
   const baseFee = PRICING.DELIVERY_MIN;
   let extraFee = 0;
-  if (distanceKm > 1) {
-    extraFee = Math.round((distanceKm - 1) * PRICING.DELIVERY_RATE_PER_KM);
+  if (distanceKm > PRICING.DELIVERY_FREE_KM) {
+    extraFee = Math.round((distanceKm - PRICING.DELIVERY_FREE_KM) * PRICING.DELIVERY_RATE_PER_KM);
   }
   return baseFee + extraFee;
 }
