@@ -1,5 +1,7 @@
 {
   "name": "daloamarket-payments",
+  "private": true,
+  "license": "UNLICENSED",
   "version": "1.0.0",
   "description": "API de paiement DaloaMarket pour Railway",
   "main": "index.js",
