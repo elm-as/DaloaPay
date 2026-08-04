@@ -9,6 +9,7 @@ require('dotenv').config();
 dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
+app.set('trust proxy', 1);
 
 // --- RATE LIMITERS ---
 const globalLimiter = rateLimit({
@@ -103,10 +104,10 @@ app.use(async (req, res, next) => {
   next();
 });
 
-// Variables d'environnement (à configurer dans Railway)
-const FUSION_API_URL = process.env.FUSION_API_URL || 'https://pay.moneyfusion.net/DaloaMarket/3ac2127f34e0ec8c/pay/';
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wjanjnoxzizxxhtbwyqd.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'sb_secret_pRT5BibcJEqf5J1XEPpsGg_l6-lEIxk';
+// Variables d'environnement (à configurer dans le tableau de bord d'hébergement)
+const FUSION_API_URL = process.env.FUSION_API_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SITE_URL = process.env.SITE_URL || 'https://daloamarket.com';
 
 // Validation config
@@ -595,7 +596,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         
       if (escrowErr || !escrow) {
         console.error('Escrow creation error:', escrowErr);
-        return res.status(500).json({ success: false, message: 'Erreur création escrow' });
+        return res.status(500).json({ success: false, message: escrowErr?.message || 'Erreur création escrow' });
       }
       transactionId = escrow.id;
 
