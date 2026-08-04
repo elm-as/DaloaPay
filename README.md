@@ -28,7 +28,7 @@ PORT=3000
 FUSION_API_URL=https://pay.moneyfusion.net/DaloaMarket/3ac2127f34e0ec8c/pay/
 SUPABASE_URL=https://<your-project>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
-SITE_URL=https://daloamarket.shop
+SITE_URL=https://daloamarket.com
 ```
 
 ### 2. Endpoints API

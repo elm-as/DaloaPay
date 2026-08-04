@@ -107,7 +107,7 @@ app.use(async (req, res, next) => {
 const FUSION_API_URL = process.env.FUSION_API_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SITE_URL = process.env.SITE_URL || 'https://daloamarket.shop';
+const SITE_URL = process.env.SITE_URL || 'https://daloamarket.com';
 
 // Validation config
 function checkConfig() {
@@ -226,8 +226,11 @@ app.get('/', (req, res) => {
   res.json({ ok: true, message: 'DaloaMarket Payment API' });
 });
 
-// 0) Diagnostic : IP publique du serveur (pour whitelist Money Fusion)
+// 0) Diagnostic : IP publique du serveur (accessible uniquement hors production ou avec secret admin)
 app.get('/ip', async (req, res) => {
+  if (process.env.NODE_ENV === 'production' && req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Accès non autorisé en production.' });
+  }
   try {
     const [v4, v6] = await Promise.allSettled([
       fetch('https://api.ipify.org?format=json').then(r => r.json()).catch(() => ({ ip: 'injoignable (api.ipify.org)' })),
@@ -236,17 +239,20 @@ app.get('/ip', async (req, res) => {
     res.json({
       ipv4: v4.status === 'fulfilled' ? v4.value.ip : 'erreur',
       ipv6: v6.status === 'fulfilled' ? v6.value.ip : 'N/A',
-      message: "Ajoute cette IPv4 dans ton dashboard Money Fusion (section 'API de paiement' → IP autorisees)",
     });
   } catch { res.json({ error: 'Impossible de récupérer l\'IP' }); }
 });
 
-// 0b) Diagnostic : config actuelle
+// 0b) Diagnostic : Désactivé en production pour des raisons de sécurité
 app.get('/config', (req, res) => {
+  if (process.env.NODE_ENV === 'production' && req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Accès au diagnostic désactivé en production.' });
+  }
   res.json({
-    FUSION_API_URL: FUSION_API_URL || 'NON DEFINI',
-    SUPABASE_URL: SUPABASE_URL || 'NON DEFINI',
-    SUPABASE_KEY_OK: !!SUPABASE_SERVICE_ROLE_KEY,
+    status: 'ok',
+    FUSION_API_URL_SET: !!FUSION_API_URL,
+    SUPABASE_URL_SET: !!SUPABASE_URL,
+    SUPABASE_KEY_SET: !!SUPABASE_SERVICE_ROLE_KEY,
     SITE_URL,
     PORT: process.env.PORT || 3000,
   });
@@ -495,14 +501,39 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     
     if (type === 'order') {
       // 1. Lire la db pour le prix de l'article + coordonnées vendeur
-      const { data: listing, error: listingErr } = await supabase
-        .from('listings')
-        .select('price, user_id')
-        .eq('id', orderInput.listing_id)
-        .single();
-      
+      let listing = null;
+      let listingErr = null;
+
+      const rawListingId = orderInput?.listing_id;
+      if (rawListingId) {
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawListingId);
+        if (isUUID) {
+          const res = await supabase
+            .from('listings')
+            .select('id, price, user_id')
+            .eq('id', rawListingId)
+            .maybeSingle();
+          listing = res.data;
+          listingErr = res.error;
+        }
+
+        if (!listing) {
+          // Fallback : recherche par short ID ou préfixe (ex: a1b2c3d4)
+          const res = await supabase
+            .from('listings')
+            .select('id, price, user_id')
+            .ilike('id', `${rawListingId}%`)
+            .limit(1)
+            .maybeSingle();
+          if (res.data) {
+            listing = res.data;
+            listingErr = null;
+          }
+        }
+      }
+
       if (listingErr || !listing) {
-        console.error('Listing lookup error:', listingErr);
+        console.error('Listing lookup error:', listingErr, 'listing_id provided:', rawListingId);
         return res.status(404).json({ success: false, message: 'Article introuvable' });
       }
       
