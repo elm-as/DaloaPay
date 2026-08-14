@@ -140,20 +140,23 @@ async function sendWebPush(subscription, payload) {
     await webpush.sendNotification(pushSubscription, stringPayload);
     return { success: true };
   } catch (err) {
-    if (err.statusCode === 404 || err.statusCode === 410) {
-      console.log(`[WebPush] Subscription expired or gone (${err.statusCode}), deleting endpoint:`, subscription.endpoint);
+    const status = err.statusCode || err.status;
+    const body = err.body || err.message;
+    console.error(`[WebPush] Error (${status}): ${body} (endpoint: ${subscription.endpoint?.slice(0, 50)}...)`);
+
+    // Si la souscription est invalide, expirée ou créée avec une ancienne clé VAPID (401/403/404/410)
+    if (status === 401 || status === 403 || status === 404 || status === 410) {
+      console.log(`[WebPush] Cleaning up invalid/stale subscription (${status})`);
       try {
         const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
           auth: { autoRefreshToken: false, persistSession: false },
         });
         await supabase.from('push_subscriptions').delete().eq('endpoint', subscription.endpoint);
       } catch (delErr) {
-        console.error('[WebPush] Error deleting expired subscription:', delErr);
+        console.error('[WebPush] Error deleting invalid subscription:', delErr);
       }
-    } else {
-      console.error('[WebPush] Error sending notification:', err.message || err);
     }
-    return { success: false, error: err.message, statusCode: err.statusCode };
+    return { success: false, error: err.message, statusCode: status };
   }
 }
 
