@@ -112,15 +112,19 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SITE_URL = process.env.SITE_URL || 'https://daloamarket.com';
 
 // --- WEB PUSH CONFIGURATION (VAPID) ---
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BCU8msD00uw2OYTKGZ_U-d-2cp2SPo7iQzkapnEP9hVsKzPf_eAZduYOqmmzGz58b0k-zT-Z3ogsymll11ZfRx4';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'CmDQOuxu_lsDSPoEIDaY7En_dL_UiBRaUWcz28ZD_k8';
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contact@daloamarket.com';
 
-try {
-  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-  console.log('[WebPush] VAPID configured successfully');
-} catch (vapidErr) {
-  console.error('[WebPush] Error setting VAPID details:', vapidErr);
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    console.log('[WebPush] VAPID configured successfully from env');
+  } catch (vapidErr) {
+    console.error('[WebPush] Error setting VAPID details:', vapidErr);
+  }
+} else {
+  console.warn('[WebPush Warning] VAPID_PUBLIC_KEY or VAPID_PRIVATE_KEY is missing from environment variables.');
 }
 
 async function sendWebPush(subscription, payload) {
