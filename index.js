@@ -698,10 +698,10 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
       return res.status(502).json({ success: false, message: fusionData?.message || 'Erreur Money Fusion' });
     }
 
-    // Normaliser l'URL de paiement MoneyFusion pour éviter les 404 sur les domaines payin.moneyfusion.net
+    // URL de paiement retournée par MoneyFusion
     let validPaymentUrl = fusionData.url;
-    if (fusionData.token && (!validPaymentUrl || validPaymentUrl.includes('payin.moneyfusion.net'))) {
-      validPaymentUrl = `https://pay.moneyfusion.net/pay/${fusionData.token}`;
+    if (!validPaymentUrl && fusionData.token) {
+      validPaymentUrl = `https://payin.moneyfusion.net/payment/${fusionData.token}/${Math.round(finalAmount)}/${encodeURIComponent(customerName || 'Client')}`;
     }
 
     // Sauvegarder le token
