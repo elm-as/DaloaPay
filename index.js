@@ -647,7 +647,6 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     }
 
     const baseUrl = SITE_URL.replace(/\/$/, '');
-    // Pour les orders, on ne passe plus order_id dans l'URL (il n'existe pas encore)
     const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
@@ -699,14 +698,19 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
       return res.status(502).json({ success: false, message: fusionData?.message || 'Erreur Money Fusion' });
     }
 
+    // Normaliser l'URL de paiement MoneyFusion pour éviter les 404 sur les domaines payin.moneyfusion.net
+    let validPaymentUrl = fusionData.url;
+    if (fusionData.token && (!validPaymentUrl || validPaymentUrl.includes('payin.moneyfusion.net'))) {
+      validPaymentUrl = `https://pay.moneyfusion.net/pay/${fusionData.token}`;
+    }
+
     // Sauvegarder le token
     if (type === 'order') {
       await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
-      // On ne renvoie PAS d'order_id (il n'existe pas encore)
-      return res.json({ success: true, token: fusionData.token, payment_url: fusionData.url, transactionId });
+      return res.json({ success: true, token: fusionData.token, payment_url: validPaymentUrl, transactionId });
     } else {
       await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
-      return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: fusionData.url });
+      return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: validPaymentUrl });
     }
   } catch (e) {
     console.error('ERROR /create-payment:', e.message || e);
@@ -921,7 +925,6 @@ app.post('/payout-webhook', async (req, res) => {
         
         if (data && data.length > 0) {
           updatedRows = data;
-          break;
         }
         
         attempts++;
