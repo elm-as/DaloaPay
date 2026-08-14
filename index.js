@@ -650,6 +650,26 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
+    // Résolution et assainissement du numéro de téléphone client (Format Côte d'Ivoire 10 chiffres)
+    let cleanPhone = (customerPhone || '').trim().replace(/\s+/g, '');
+    if (!cleanPhone && userId) {
+      const { data: u } = await supabase.from('users').select('phone, full_name').eq('id', userId).maybeSingle();
+      if (u?.phone) cleanPhone = u.phone.trim().replace(/\s+/g, '');
+      if (!customerName && u?.full_name) customerName = u.full_name;
+    }
+
+    if (cleanPhone.startsWith('+225')) {
+      cleanPhone = cleanPhone.slice(4);
+    } else if (cleanPhone.startsWith('225') && cleanPhone.length === 13) {
+      cleanPhone = cleanPhone.slice(3);
+    } else if (cleanPhone.startsWith('00225')) {
+      cleanPhone = cleanPhone.slice(5);
+    }
+
+    if (!cleanPhone || cleanPhone === '0000000000') {
+      cleanPhone = '0700000000';
+    }
+
     const labelByType = { 
       seller_badge: 'Badge Vendeur Pro (30 jours)', 
       listing_pack_10: 'Pack 10 annonces (500 FCFA)', 
@@ -662,7 +682,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
       totalPrice: Math.round(finalAmount),
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
       personal_Info: [{ userId, transactionId, type, ...(metadata || {}), ...(orderInput || {}) }],
-      numeroSend: customerPhone || '0000000000',
+      numeroSend: cleanPhone,
       nomclient: customerName || 'Client DaloaMarket',
       return_url: returnUrl,
       webhook_url: webhookUrl,
