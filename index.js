@@ -650,12 +650,13 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
-    // Résolution et assainissement du numéro de téléphone client (Format Côte d'Ivoire 10 chiffres)
+    // Résolution et assainissement du nom et du numéro de téléphone client
+    let resolvedName = (customerName || '').trim();
     let cleanPhone = (customerPhone || '').trim().replace(/\s+/g, '');
-    if (!cleanPhone && userId) {
+    if ((!cleanPhone || !resolvedName) && userId) {
       const { data: u } = await supabase.from('users').select('phone, full_name').eq('id', userId).maybeSingle();
-      if (u?.phone) cleanPhone = u.phone.trim().replace(/\s+/g, '');
-      if (!customerName && u?.full_name) customerName = u.full_name;
+      if (!cleanPhone && u?.phone) cleanPhone = u.phone.trim().replace(/\s+/g, '');
+      if (!resolvedName && u?.full_name) resolvedName = u.full_name.trim();
     }
 
     if (cleanPhone.startsWith('+225')) {
@@ -683,7 +684,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
       personal_Info: [{ userId, transactionId, type, ...(metadata || {}), ...(orderInput || {}) }],
       numeroSend: cleanPhone,
-      nomclient: customerName || 'Client DaloaMarket',
+      nomclient: resolvedName || 'Client DaloaMarket',
       return_url: returnUrl,
       webhook_url: webhookUrl,
     };
@@ -721,7 +722,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     // URL de paiement retournée par MoneyFusion
     let validPaymentUrl = fusionData.url;
     if (!validPaymentUrl && fusionData.token) {
-      validPaymentUrl = `https://payin.moneyfusion.net/payment/${fusionData.token}/${Math.round(finalAmount)}/${encodeURIComponent(customerName || 'Client')}`;
+      validPaymentUrl = `https://payin.moneyfusion.net/payment/${fusionData.token}/${Math.round(finalAmount)}/${encodeURIComponent(resolvedName || 'Client')}`;
     }
 
     // Sauvegarder le token
