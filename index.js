@@ -3,6 +3,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const dns = require('dns');
 const rateLimit = require('express-rate-limit');
+const webpush = require('web-push');
 require('dotenv').config();
 
 // Node 18+ fetch() préfère l'IPv6, ce qui fait planter les requêtes vers MoneyFusion sur Render
@@ -109,6 +110,94 @@ const FUSION_API_URL = process.env.FUSION_API_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SITE_URL = process.env.SITE_URL || 'https://daloamarket.com';
+
+// --- WEB PUSH CONFIGURATION (VAPID) ---
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || 'BCU8msD00uw2OYTKGZ_U-d-2cp2SPo7iQzkapnEP9hVsKzPf_eAZduYOqmmzGz58b0k-zT-Z3ogsymll11ZfRx4';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'CmDQOuxu_lsDSPoEIDaY7En_dL_UiBRaUWcz28ZD_k8';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contact@daloamarket.com';
+
+try {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  console.log('[WebPush] VAPID configured successfully');
+} catch (vapidErr) {
+  console.error('[WebPush] Error setting VAPID details:', vapidErr);
+}
+
+async function sendWebPush(subscription, payload) {
+  try {
+    const pushSubscription = {
+      endpoint: subscription.endpoint,
+      keys: {
+        p256dh: subscription.keys_p256dh,
+        auth: subscription.keys_auth,
+      },
+    };
+    const stringPayload = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    await webpush.sendNotification(pushSubscription, stringPayload);
+    return { success: true };
+  } catch (err) {
+    if (err.statusCode === 404 || err.statusCode === 410) {
+      console.log(`[WebPush] Subscription expired or gone (${err.statusCode}), deleting endpoint:`, subscription.endpoint);
+      try {
+        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        await supabase.from('push_subscriptions').delete().eq('endpoint', subscription.endpoint);
+      } catch (delErr) {
+        console.error('[WebPush] Error deleting expired subscription:', delErr);
+      }
+    } else {
+      console.error('[WebPush] Error sending notification:', err.message || err);
+    }
+    return { success: false, error: err.message, statusCode: err.statusCode };
+  }
+}
+
+async function sendPushToUser(userId, payload) {
+  if (!userId) return { success: false, message: 'userId required' };
+  try {
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: subs, error } = await supabase
+      .from('push_subscriptions')
+      .select('*')
+      .eq('user_id', userId);
+
+    if (error || !subs || subs.length === 0) {
+      return { success: true, sent: 0, message: 'No subscriptions found for user' };
+    }
+
+    const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
+    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    return { success: true, sent: sentCount, total: subs.length };
+  } catch (err) {
+    console.error('[WebPush] sendPushToUser failed:', err);
+    return { success: false, error: err.message };
+  }
+}
+
+async function broadcastPush(payload) {
+  try {
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: subs, error } = await supabase
+      .from('push_subscriptions')
+      .select('*');
+
+    if (error || !subs || subs.length === 0) {
+      return { success: true, sent: 0, message: 'No active subscriptions found' };
+    }
+
+    const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
+    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    return { success: true, sent: sentCount, total: subs.length };
+  } catch (err) {
+    console.error('[WebPush] broadcastPush failed:', err);
+    return { success: false, error: err.message };
+  }
+}
 
 // Validation config
 function checkConfig() {
@@ -224,6 +313,19 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
     delivery_lng: deliveryLng,
     delivery_price: escrow.delivery_fee,
   });
+
+  // Notification push au vendeur
+  if (escrow.seller_id) {
+    supabase.from('listings').select('title').eq('id', meta.listing_id).maybeSingle().then(({ data: l }) => {
+      const itemTitle = l?.title || 'Votre article';
+      sendPushToUser(escrow.seller_id, {
+        title: '🎉 Nouvelle commande reçue !',
+        body: `Vous avez vendu "${itemTitle}" pour ${Number(escrow.total_amount || 0).toLocaleString('fr-FR')} FCFA.`,
+        url: `/mes-commandes`,
+        tag: `order-${order.id}`,
+      }).catch(e => console.error('[Push Order Error]:', e));
+    });
+  }
 
   return order.id;
 }
@@ -1002,6 +1104,113 @@ app.post('/payout-webhook', async (req, res) => {
   }
 });
 
+// ========================================
+// 5) Web Push Notification Endpoints
+// ========================================
+
+// A. Broadcast vers tous les appareils abonnés (Admin / Annonces globales)
+app.post('/push/broadcast', async (req, res) => {
+  try {
+    const { title, body, url, tag, image } = req.body || {};
+    if (!title || !body) {
+      return res.status(400).json({ success: false, message: 'Titre et corps requis' });
+    }
+
+    const payload = {
+      title,
+      body,
+      url: url || '/',
+      tag: tag || 'admin-broadcast',
+      image: image || null,
+      icon: '/web-app-manifest-192x192.png',
+    };
+
+    // Insérer dans l'historique notifications Supabase
+    try {
+      const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      });
+      await supabase.from('notifications').insert({
+        title,
+        body,
+        url: url || null,
+      });
+    } catch (dbErr) {
+      console.warn('[Push Broadcast] Supabase insert warning:', dbErr.message);
+    }
+
+    const result = await broadcastPush(payload);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Push Broadcast Exception]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// B. Notification ciblée pour un utilisateur spécifique (Messages chat, commandes)
+app.post('/push/notify-user', async (req, res) => {
+  try {
+    const { targetUserId, title, body, url, tag, image } = req.body || {};
+    if (!targetUserId || !title || !body) {
+      return res.status(400).json({ success: false, message: 'targetUserId, title et body requis' });
+    }
+
+    const payload = {
+      title,
+      body,
+      url: url || '/',
+      tag: tag || 'user-notification',
+      image: image || null,
+      icon: '/web-app-manifest-192x192.png',
+    };
+
+    const result = await sendPushToUser(targetUserId, payload);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Push Notify User Exception]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// C. Endpoint générique /push/send
+app.post('/push/send', async (req, res) => {
+  try {
+    const { target, title, body, url, tag } = req.body || {};
+    if (!title || !body) {
+      return res.status(400).json({ success: false, message: 'Titre et corps requis' });
+    }
+
+    const payload = {
+      title,
+      body,
+      url: url || '/',
+      tag: tag || 'notification',
+      icon: '/web-app-manifest-192x192.png',
+    };
+
+    if (target === 'all' || !target) {
+      const result = await broadcastPush(payload);
+      return res.json({ success: true, ...result });
+    }
+
+    if (Array.isArray(target)) {
+      const results = await Promise.allSettled(target.map(uid => sendPushToUser(uid, payload)));
+      const sentTotal = results.reduce((acc, r) => acc + (r.status === 'fulfilled' && r.value?.sent ? r.value.sent : 0), 0);
+      return res.json({ success: true, sent: sentTotal, targets: target.length });
+    }
+
+    if (typeof target === 'string') {
+      const result = await sendPushToUser(target, payload);
+      return res.json({ success: true, ...result });
+    }
+
+    return res.status(400).json({ success: false, message: 'Cible invalide' });
+  } catch (err) {
+    console.error('[Push Send Exception]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.use((err, req, res, next) => {
   res.status(500).json({ success: false, message: err.message || 'Internal error' });
 });
@@ -1009,4 +1218,4 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 console.log('FUSION_API_URL from env:', JSON.stringify(process.env.FUSION_API_URL));
 console.log('SUPABASE_URL from env:', JSON.stringify(process.env.SUPABASE_URL));
-app.listen(PORT, () => console.log(`Payment API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Payment & Push API running on port ${PORT}`));

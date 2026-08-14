@@ -14,7 +14,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
-    "express-rate-limit": "^7.3.1"
+    "express-rate-limit": "^7.3.1",
+    "web-push": "^3.6.7"
   },
   "engines": {
     "node": ">=18.0.0"
