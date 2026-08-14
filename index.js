@@ -125,6 +125,7 @@ const PRICING = {
   DELIVERY_FREE_KM: 1.5,
   BUYER_FEE_RATE: 0.03,
   SELLER_FEE_RATE: 0.035,
+  PRO_SELLER_FEE_RATE: 0.025,
   DRIVER_FEE_RATE: 0.10
 };
 
@@ -175,6 +176,10 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
       buyer_id: escrow.buyer_id,
       seller_id: escrow.seller_id,
       listing_id: meta.listing_id,
+      variant_id: meta.variant_id || null,
+      variant_label: meta.variant_label || null,
+      unit_price: meta.unit_price || null,
+      quantity: Math.max(1, Number(meta.quantity) || 1),
       product_amount: meta.product_amount || (escrow.total_amount - escrow.delivery_fee - escrow.platform_fee),
       delivery_fee: escrow.delivery_fee,
       platform_commission: escrow.platform_fee,
@@ -511,7 +516,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         if (isUUID) {
           const res = await supabase
             .from('listings')
-            .select('id, price, user_id')
+            .select('id, price, user_id, stock, status, variants')
             .eq('id', rawListingId)
             .maybeSingle();
           listing = res.data;
@@ -522,7 +527,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
           // Fallback : recherche par short ID ou préfixe (ex: a1b2c3d4)
           const res = await supabase
             .from('listings')
-            .select('id, price, user_id')
+            .select('id, price, user_id, stock, status, variants')
             .ilike('id', `${rawListingId}%`)
             .limit(1)
             .maybeSingle();
@@ -538,6 +543,31 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         return res.status(404).json({ success: false, message: 'Article introuvable' });
       }
       
+      if (listing.status !== 'active') {
+        return res.status(409).json({ success: false, message: 'Cette annonce n’est plus disponible.' });
+      }
+
+      const quantity = Math.max(1, Math.floor(Number(orderInput?.quantity) || 1));
+      const variants = Array.isArray(listing.variants) ? listing.variants : [];
+      const selectedVariant = orderInput?.variant_id
+        ? variants.find((variant) => variant.id === orderInput.variant_id)
+        : null;
+
+      if (variants.length > 0 && (!selectedVariant || selectedVariant.active === false)) {
+        return res.status(400).json({ success: false, message: 'Veuillez choisir une taille valide.' });
+      }
+
+      const availableStock = selectedVariant ? Number(selectedVariant.stock) || 0 : Number(listing.stock) || 0;
+      if (availableStock < quantity) {
+        return res.status(409).json({ success: false, message: 'La quantité demandée n’est plus disponible pour cette taille.' });
+      }
+
+      const unitPrice = selectedVariant?.price != null ? Number(selectedVariant.price) : Number(listing.price);
+      if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+        return res.status(400).json({ success: false, message: 'Prix de l’article invalide.' });
+      }
+      const productAmount = unitPrice * quantity;
+
       // Récupérer le profil du vendeur (statut PRO + coordonnées boutique)
       const { data: sellerProfile } = await supabase
         .from('users')
@@ -546,7 +576,7 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         .single();
         
       const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
-      const sellerFeeRate = isProSeller ? 0.025 : PRICING.SELLER_FEE_RATE;
+      const sellerFeeRate = isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE;
       
       // Calcul dynamique de la distance et des frais de livraison
       const deliveryLat = orderInput.delivery_lat || null;
@@ -559,12 +589,12 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
       }
       
-      const deliveryFee = calculateDeliveryFee(distanceKm);
-      const commission = Math.round(listing.price * PRICING.BUYER_FEE_RATE);
-      const sellerCommission = Math.round(listing.price * sellerFeeRate);
-      finalAmount = listing.price + deliveryFee + commission;
+      const deliveryFee = orderInput?.delivery_mode === 'pickup' ? 0 : calculateDeliveryFee(distanceKm);
+      const commission = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
+      const sellerCommission = Math.round(productAmount * sellerFeeRate);
+      finalAmount = productAmount + deliveryFee + commission;
       
-      console.log(`Order pricing: distance=${distanceKm.toFixed(1)}km, deliveryFee=${deliveryFee}F, total=${finalAmount}F`);
+      console.log(`Order pricing: quantity=${quantity}, unitPrice=${unitPrice}F, distance=${distanceKm.toFixed(1)}km, deliveryFee=${deliveryFee}F, total=${finalAmount}F`);
       
       // 2. Créer UNIQUEMENT l'escrow_transaction (PAS d'order)
       // L'escrow stocke les métadonnées nécessaires pour créer l'order plus tard
@@ -575,14 +605,18 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
           buyer_id: userId,
           seller_id: listing.user_id,
           total_amount: finalAmount,
-          seller_amount: listing.price - sellerCommission,
+          seller_amount: productAmount - sellerCommission,
           delivery_fee: deliveryFee,
           platform_fee: commission,
           status: 'pending',
           payment_method: 'mobile_money',
           order_metadata: {
-            listing_id: orderInput.listing_id,
-            product_amount: listing.price,
+            listing_id: listing.id,
+            variant_id: selectedVariant?.id || null,
+            variant_label: selectedVariant?.label || null,
+            unit_price: unitPrice,
+            quantity,
+            product_amount: productAmount,
             delivery_address: orderInput.delivery_address || 'Daloa',
             delivery_mode: orderInput.delivery_mode || 'delivery',
             delivery_lat: deliveryLat,
