@@ -161,7 +161,7 @@ async function sendWebPush(subscription, payload) {
 }
 
 async function sendPushToUser(userId, payload) {
-  if (!userId) return { success: false, message: 'userId required' };
+  if (!userId) return { success: false, message: 'Identifiant utilisateur requis' };
   try {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
@@ -172,7 +172,7 @@ async function sendPushToUser(userId, payload) {
       .eq('user_id', userId);
 
     if (error || !subs || subs.length === 0) {
-      return { success: true, sent: 0, message: 'No subscriptions found for user' };
+      return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
     }
 
     const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
@@ -194,7 +194,7 @@ async function broadcastPush(payload) {
       .select('*');
 
     if (error || !subs || subs.length === 0) {
-      return { success: true, sent: 0, message: 'No active subscriptions found' };
+      return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
     const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
@@ -862,7 +862,7 @@ app.post('/payment-webhook', async (req, res) => {
     const transactionId = personal?.transactionId;
     const type = personal?.type;
 
-    if (!transactionId || !type) return res.status(400).json({ ok: false, message: 'Invalid payload' });
+    if (!transactionId || !type) return res.status(400).json({ ok: false, message: 'Données de requête invalides' });
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
@@ -1224,7 +1224,7 @@ app.post('/push/send', async (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  res.status(500).json({ success: false, message: err.message || 'Internal error' });
+  res.status(500).json({ success: false, message: err.message || 'Erreur interne du serveur' });
 });
 
 const PORT = process.env.PORT || 3000;
