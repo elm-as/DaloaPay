@@ -596,14 +596,18 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Check system_settings for emergency payment suspension / MoneyFusion crash fallback
-    const { data: sysSettings } = await supabase
+    const { data: allSettings } = await supabase
       .from('system_settings')
-      .select('value')
-      .eq('key', 'payment_settings')
-      .maybeSingle();
+      .select('key, value')
+      .in('key', ['payment_settings', 'phase_config']);
 
-    const payConfig = sysSettings?.value || {};
+    const settingsMap = {};
+    (allSettings || []).forEach(s => { settingsMap[s.key] = s.value; });
+
+    const payConfig = settingsMap['payment_settings'] || {};
+    const phaseConfig = settingsMap['phase_config'] || {};
+    const isPhase0 = phaseConfig.phase === 0;
+
     if (payConfig.disable_online_payments || payConfig.status === 'down') {
       return res.status(503).json({
         success: false,
@@ -685,7 +689,8 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         .single();
         
       const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
-      const sellerFeeRate = isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE;
+      // En Phase 0 : 0% de commission vendeur pour maximiser l'adoption
+      const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
       
       // Calcul dynamique de la distance et des frais de livraison
       const deliveryLat = orderInput.delivery_lat || null;
