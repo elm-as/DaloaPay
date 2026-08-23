@@ -1346,20 +1346,112 @@ app.post('/push/webhook', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 3. Courses livreurs
+    // 3. Courses et Livraisons
     if (table === 'delivery_assignments') {
-      if (record.driver_id && type === 'UPDATE') {
-        const status = record.status;
-        if (status === 'assigned' || status === 'pending') {
-          await sendPushToUser(record.driver_id, {
-            title: '🚚 Nouvelle course disponible !',
-            body: 'Une nouvelle livraison vous attend. Ouvrez l\'app pour l\'accepter.',
-            url: '/courses',
-            tag: `delivery-${record.id}`,
-            icon: '/web-app-manifest-192x192.png',
+      const status = record.status;
+      const oldStatus = old_record?.status;
+      const priceText = record.delivery_price ? `${Number(record.delivery_price).toLocaleString('fr-FR')} FCFA` : 'Rémunérée';
+      const orderUrl = `/suivi/${record.order_id}`;
+
+      // A. Nouvelle course créée (INSERT) ou mise à disposition (UPDATE vers awaiting_pickup)
+      if (type === 'INSERT' || (type === 'UPDATE' && status === 'awaiting_pickup' && oldStatus !== 'awaiting_pickup')) {
+        // Cas 1 : Livreur spécifique assigné (ex: livreur affilié)
+        if (record.delivery_person_id) {
+          const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+            auth: { autoRefreshToken: false, persistSession: false },
+          });
+          const { data: dp } = await supabase
+            .from('delivery_persons')
+            .select('user_id')
+            .eq('id', record.delivery_person_id)
+            .maybeSingle();
+
+          if (dp?.user_id) {
+            await sendPushToUser(dp.user_id, {
+              title: '🛵 Nouvelle course assignée !',
+              body: `Une livraison vous a été confiée à Daloa (${priceText}). Ouvrez l'application pour démarrer.`,
+              url: orderUrl,
+              tag: `delivery-assign-${record.id}`,
+            });
+          }
+        } 
+        // Cas 2 : Course publique ouverte à tous les livreurs de Daloa
+        else if (!record.is_private) {
+          const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+            auth: { autoRefreshToken: false, persistSession: false },
+          });
+          const { data: drivers } = await supabase
+            .from('delivery_persons')
+            .select('user_id')
+            .eq('is_available', true);
+
+          if (drivers && drivers.length > 0) {
+            console.log(`[Push Delivery] 🛵 Diffusion nouvelle course à ${drivers.length} livreur(s) disponible(s)...`);
+            for (const driver of drivers) {
+              if (driver.user_id) {
+                sendPushToUser(driver.user_id, {
+                  title: '🛵 Nouvelle course disponible !',
+                  body: `Livraison à Daloa • Gain : ${priceText}. Premier arrivé, premier servi ! ⚡`,
+                  url: orderUrl,
+                  tag: `delivery-open-${record.id}`,
+                }).catch((err) => console.warn('[Push Delivery Error]:', err));
+              }
+            }
+          }
+        }
+      }
+
+      // B. Prise en charge du colis par le livreur (picked_up)
+      if (type === 'UPDATE' && status === 'picked_up' && oldStatus !== 'picked_up') {
+        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const { data: order } = await supabase
+          .from('orders')
+          .select('buyer_id')
+          .eq('id', record.order_id)
+          .maybeSingle();
+
+        if (order?.buyer_id) {
+          await sendPushToUser(order.buyer_id, {
+            title: '🚚 Votre livreur est en route !',
+            body: 'Le livreur a récupéré votre colis et fait route vers votre adresse.',
+            url: orderUrl,
+            tag: `order-transit-${record.order_id}`,
           });
         }
       }
+
+      // C. Arrivée à destination (delivered)
+      if (type === 'UPDATE' && status === 'delivered' && oldStatus !== 'delivered') {
+        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const { data: order } = await supabase
+          .from('orders')
+          .select('buyer_id, seller_id')
+          .eq('id', record.order_id)
+          .maybeSingle();
+
+        if (order?.buyer_id) {
+          await sendPushToUser(order.buyer_id, {
+            title: '📦 Colis arrivé !',
+            body: 'Votre livreur est là. Communiquez votre code OTP pour valider la livraison.',
+            url: orderUrl,
+            tag: `order-delivered-${record.order_id}`,
+          });
+        }
+
+        if (order?.seller_id) {
+          await sendPushToUser(order.seller_id, {
+            title: '✅ Livraison effectuée !',
+            body: 'Le colis a été remis à l\'acheteur avec succès.',
+            url: `/mes-commandes`,
+            tag: `seller-delivered-${record.order_id}`,
+          });
+        }
+      }
+
       return res.json({ ok: true });
     }
 
