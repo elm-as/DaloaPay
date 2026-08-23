@@ -171,12 +171,20 @@ async function sendPushToUser(userId, payload) {
       .select('*')
       .eq('user_id', userId);
 
-    if (error || !subs || subs.length === 0) {
+    if (error) {
+      console.error(`[WebPush] Erreur DB pour user ${userId}:`, error.message);
+      return { success: false, error: error.message };
+    }
+
+    if (!subs || subs.length === 0) {
+      console.log(`[WebPush] ⚠️ Aucun abonnement push trouvé en base pour l'utilisateur ${userId}.`);
       return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
     }
 
+    console.log(`[WebPush] 🚀 Envoi de la notification à ${subs.length} appareil(s) pour l'utilisateur ${userId}...`);
     const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
     const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+    console.log(`[WebPush] ✅ Résultat envoi user ${userId}: ${sentCount}/${subs.length} délivré(s).`);
     return { success: true, sent: sentCount, total: subs.length };
   } catch (err) {
     console.error('[WebPush] sendPushToUser failed:', err);
@@ -1220,6 +1228,142 @@ app.post('/push/send', async (req, res) => {
   } catch (err) {
     console.error('[Push Send Exception]:', err);
     return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// E. Register Push Subscription (called by frontend — uses service_role to bypass RLS)
+app.post('/push/register', async (req, res) => {
+  try {
+    const { user_id, endpoint, keys_p256dh, keys_auth, user_agent } = req.body || {};
+
+    if (!user_id || !endpoint || !keys_p256dh || !keys_auth) {
+      console.log('[Push Register] ❌ Champs manquants:', { user_id: !!user_id, endpoint: !!endpoint, keys_p256dh: !!keys_p256dh, keys_auth: !!keys_auth });
+      return res.status(400).json({ success: false, message: 'Champs requis: user_id, endpoint, keys_p256dh, keys_auth' });
+    }
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Supprimer toute souscription existante sur cet endpoint (évite les doublons)
+    await supabase.from('push_subscriptions').delete().eq('endpoint', endpoint);
+
+    // Insérer la nouvelle souscription
+    const { error } = await supabase.from('push_subscriptions').insert({
+      user_id,
+      endpoint,
+      keys_p256dh,
+      keys_auth,
+      user_agent: user_agent || null,
+    });
+
+    if (error) {
+      console.error('[Push Register] ❌ Erreur insertion Supabase:', error.message);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    console.log(`[Push Register] ✅ Token enregistré pour user ${user_id} (endpoint: ${endpoint.slice(0, 60)}...)`);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[Push Register] Exception:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// D. Webhook Supabase Database Trigger (Notifications automatiques en arrière-plan)
+app.post('/push/webhook', async (req, res) => {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    return res.status(503).json({ ok: false, error: 'Push VAPID keys non configurées' });
+  }
+
+  const { type, table, record, old_record } = req.body || {};
+  if (!record || !table) {
+    return res.status(400).json({ ok: false, error: 'Payload webhook invalide' });
+  }
+
+  try {
+    // 1. Messages du chat
+    if (table === 'messages' && type === 'INSERT') {
+      const targetUserId = record.receiver_id;
+      if (!targetUserId) return res.json({ ok: true, skipped: 'no receiver_id' });
+
+      const content = record.content || '';
+      const payload = {
+        title: '💬 Nouveau message DaloaMarket',
+        body: content.length > 80 ? content.slice(0, 80) + '...' : (content || 'Vous avez reçu un nouveau message.'),
+        url: `/messages/${record.listing_id || 'inbox'}/${record.sender_id}`,
+        tag: `chat-${record.sender_id}`,
+        icon: '/web-app-manifest-192x192.png',
+      };
+
+      const result = await sendPushToUser(targetUserId, payload);
+      return res.json({ ok: true, ...result });
+    }
+
+    // 2. Statuts de commande (Acheteur + Vendeur)
+    if (table === 'orders' && type === 'UPDATE') {
+      const status = record.status;
+      const oldStatus = old_record?.status;
+      if (status === oldStatus) return res.json({ ok: true, skipped: 'status inchangé' });
+
+      // Notifier l'acheteur
+      if (record.buyer_id) {
+        let buyerMsg = 'Votre commande a été mise à jour.';
+        if (status === 'paid') buyerMsg = 'Paiement confirmé ! Votre commande est en préparation.';
+        else if (status === 'picked_up') buyerMsg = 'Le livreur a récupéré votre colis et fait route vers vous. 🚚';
+        else if (status === 'delivered') buyerMsg = 'Colis livré avec succès ! Merci de votre confiance. ✅';
+        else if (status === 'disputed') buyerMsg = 'Litige ouvert sur votre commande. Notre support intervient.';
+
+        await sendPushToUser(record.buyer_id, {
+          title: '📦 Mise à jour de commande',
+          body: buyerMsg,
+          url: `/suivi/${record.id}`,
+          tag: `order-${record.id}`,
+          icon: '/web-app-manifest-192x192.png',
+        });
+      }
+
+      // Notifier le vendeur
+      if (record.seller_id) {
+        let sellerMsg = null;
+        if (status === 'paid') sellerMsg = 'Nouvelle vente confirmée ! Préparez le colis pour le livreur. 🛍️';
+        else if (status === 'delivered') sellerMsg = 'Livraison validée ! Vos gains seront disponibles sous 24h. ✅';
+
+        if (sellerMsg) {
+          await sendPushToUser(record.seller_id, {
+            title: '🛍️ Notification Vendeur',
+            body: sellerMsg,
+            url: '/mes-commandes',
+            tag: `order-seller-${record.id}`,
+            icon: '/web-app-manifest-192x192.png',
+          });
+        }
+      }
+
+      return res.json({ ok: true });
+    }
+
+    // 3. Courses livreurs
+    if (table === 'delivery_assignments') {
+      if (record.driver_id && type === 'UPDATE') {
+        const status = record.status;
+        if (status === 'assigned' || status === 'pending') {
+          await sendPushToUser(record.driver_id, {
+            title: '🚚 Nouvelle course disponible !',
+            body: 'Une nouvelle livraison vous attend. Ouvrez l\'app pour l\'accepter.',
+            url: '/courses',
+            tag: `delivery-${record.id}`,
+            icon: '/web-app-manifest-192x192.png',
+          });
+        }
+      }
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: true, skipped: 'unhandled table/type' });
+  } catch (err) {
+    console.error('[Push Webhook Exception]:', err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 

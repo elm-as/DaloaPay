@@ -2,7 +2,7 @@
 const https = require('https');
 
 const options = {
-  hostname: 'moneypay-production.up.railway.app',
+  hostname: 'api.daloamarket.com',
   port: 443,
   path: '/create-payment',
   method: 'POST',
@@ -14,9 +14,9 @@ const options = {
 const data = JSON.stringify({
   type: 'seller_badge',
   amount: 1000,
-  customerName: 'Test',
+  customerName: 'Oulobo Elmas',
   customerPhone: '0123456789',
-  userId: '550e8400-e29b-41d4-a716-446655440000'
+  userId: 'af3721dd-6c4d-4709-930b-2f509f16e428'
 });
 
 console.log('Testing API...');
