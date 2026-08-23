@@ -1245,19 +1245,22 @@ app.post('/push/register', async (req, res) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Supprimer toute souscription existante sur cet endpoint (évite les doublons)
-    await supabase.from('push_subscriptions').delete().eq('endpoint', endpoint);
-
-    // Insérer la nouvelle souscription
-    const { error } = await supabase.from('push_subscriptions').insert({
-      user_id,
-      endpoint,
-      keys_p256dh,
-      keys_auth,
-      user_agent: user_agent || null,
-    });
+    // Insérer ou mettre à jour la souscription (gère la concurrence sans crash)
+    const { error } = await supabase.from('push_subscriptions').upsert(
+      {
+        user_id,
+        endpoint,
+        keys_p256dh,
+        keys_auth,
+        user_agent: user_agent || null,
+      },
+      { onConflict: 'user_id,endpoint' }
+    );
 
     if (error) {
+      if (error.code === '23505') {
+        return res.json({ success: true, duplicate: true });
+      }
       console.error('[Push Register] ❌ Erreur insertion Supabase:', error.message);
       return res.status(500).json({ success: false, message: error.message });
     }
