@@ -1456,6 +1456,12 @@ app.post('/push/webhook', async (req, res) => {
     }
 
     return res.json({ ok: true, skipped: 'unhandled table/type' });
+  } catch (err) {
+    console.error('[Push Webhook Exception]:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // --- WhatsApp Channel Broadcast Endpoint (Levier A & Diffusion automatique) ---
 app.post('/api/channel/broadcast-listing', async (req, res) => {
   try {
