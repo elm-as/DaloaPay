@@ -227,7 +227,7 @@ const PRICING = {
   DELIVERY_MIN: 500,
   DELIVERY_RATE_PER_KM: 85,
   DELIVERY_FREE_KM: 1.5,
-  BUYER_FEE_RATE: 0.03,
+  BUYER_FEE_RATE: 0.0, // Annulé côté acheteur pour supprimer les frais
   SELLER_FEE_RATE: 0.035,
   PRO_SELLER_FEE_RATE: 0.025,
   DRIVER_FEE_RATE: 0.10
@@ -313,20 +313,22 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   const deliveryLat = meta.delivery_lat || personalInfo?.delivery_lat || null;
   const deliveryLng = meta.delivery_lng || personalInfo?.delivery_lng || null;
   const distanceKm = meta.distance_km || null;
+  const isPickup = (meta.delivery_mode || personalInfo?.delivery_mode) === 'pickup_point' || (meta.delivery_mode || personalInfo?.delivery_mode) === 'pickup';
 
   await supabase.from('delivery_assignments').insert({
     order_id: order.id,
     delivery_person_id: null,
     status: 'pending_seller_confirmation',
-    pickup_confirmed_by_seller: false,
+    pickup_confirmed_by_seller: isPickup,
     pickup_otp: pickupOTP,
     delivery_otp: deliveryOTP,
     pickup_otp_attempts: 0,
     delivery_otp_attempts: 0,
-    delivery_address: address,
-    delivery_lat: deliveryLat,
-    delivery_lng: deliveryLng,
-    delivery_price: escrow.delivery_fee,
+    pickup_location: 'Boutique du vendeur',
+    dropoff_location: address || 'Retrait en boutique',
+    delivery_price: escrow.delivery_fee || 0,
+    seller_id: escrow.seller_id,
+    is_private: isPickup,
   });
 
   // Notification push au vendeur
@@ -711,7 +713,8 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
         distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
       }
       
-      const deliveryFee = orderInput?.delivery_mode === 'pickup' ? 0 : calculateDeliveryFee(distanceKm);
+      const isPickupMode = orderInput?.delivery_mode === 'pickup' || orderInput?.delivery_mode === 'pickup_point';
+      const deliveryFee = isPickupMode ? 0 : calculateDeliveryFee(distanceKm);
       const commission = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
       const sellerCommission = Math.round(productAmount * sellerFeeRate);
       finalAmount = productAmount + deliveryFee + commission;
