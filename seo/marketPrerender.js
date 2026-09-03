@@ -31,7 +31,11 @@ function buildHtml({ title, description, keywords, ogImage, canonical, bodyConte
   const safeImage = escapeHtml(ogImage || 'https://daloamarket.shop/og-image.png');
   const safeCanonical = escapeHtml(canonical || 'https://daloamarket.shop');
 
-  const jsonLdScript = jsonLd ? `<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>` : '';
+  // JSON.stringify n'échappe ni `<` ni `/` : une valeur contenant `</script>`
+  // sortirait du bloc et permettrait une injection. On neutralise `<`.
+  const jsonLdScript = jsonLd
+    ? `<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g, '\\u003c')}</script>`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="fr">

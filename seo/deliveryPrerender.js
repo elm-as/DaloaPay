@@ -14,7 +14,11 @@ function buildDeliveryHtml({ title, description, keywords, ogImage, canonical, b
   const safeImage = escapeHtml(ogImage || 'https://daloa-delivery.shop/og-image.png');
   const safeCanonical = escapeHtml(canonical || 'https://daloa-delivery.shop');
 
-  const jsonLdScript = jsonLd ? `<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>` : '';
+  // JSON.stringify n'échappe ni `<` ni `/` : une valeur contenant `</script>`
+  // sortirait du bloc et permettrait une injection. On neutralise `<`.
+  const jsonLdScript = jsonLd
+    ? `<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g, '\\u003c')}</script>`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="fr">

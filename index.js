@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const dns = require('dns');
+const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const webpush = require('web-push');
 require('dotenv').config();
@@ -46,8 +47,31 @@ const payoutLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
-app.use(cors());
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://daloamarket.com,https://delivery.daloamarket.com')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    // Pas d'origine = appel serveur-a-serveur (webhooks MoneyFusion) : autorise.
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origine non autorisee'));
+  },
+}));
 app.use(express.json());
+
+// Contrôle du bannissement d'IP (absent de ce serveur : la fonctionnalité,
+// ses tables et ses RPC existaient mais rien ne les appliquait en production).
+const { createIpBanMiddleware } = require('./ipBanMiddleware');
+app.use(createIpBanMiddleware(
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      })
+    : null
+));
 
 // --- SEO BOT PRERENDER MIDDLEWARE ---
 const { isBot } = require('./seo/botDetector');
@@ -110,6 +134,104 @@ const FUSION_API_URL = process.env.FUSION_API_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SITE_URL = process.env.SITE_URL || 'https://daloamarket.com';
+const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || 'https://api.daloamarket.com').replace(/\/$/, '');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
+const PUSH_WEBHOOK_SECRET = process.env.PUSH_WEBHOOK_SECRET || '';
+const PAYOUT_WEBHOOK_SECRET = process.env.PAYOUT_WEBHOOK_SECRET || '';
+
+// --- AUTHENTIFICATION ---
+// Portés depuis api.daloamarket.ci : ce serveur n'avait aucun contrôle d'accès,
+// /create-payment acceptait un userId arbitraire dans le corps de la requête et
+// /process-payouts déclenchait de vrais virements sans secret.
+
+function getSupabaseAdminClient() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  return createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+}
+
+/** Comparaison en temps constant, pour ne pas fuir le secret par timing. */
+function secretMatches(candidate, expected) {
+  if (!candidate || !expected) return false;
+  const a = Buffer.from(String(candidate));
+  const b = Buffer.from(String(expected));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireAdminSecret(req, res, next) {
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ success: false, message: 'Administration non configurée.' });
+  }
+  if (!secretMatches(req.get('x-admin-secret'), ADMIN_SECRET)) {
+    return res.status(403).json({ success: false, message: 'Accès non autorisé.' });
+  }
+  next();
+}
+
+async function requireAuthenticatedUser(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Authentification requise.' });
+  }
+
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) {
+    return res.status(503).json({ success: false, message: 'Authentification indisponible.' });
+  }
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) {
+    return res.status(401).json({ success: false, message: 'Session invalide ou expirée.' });
+  }
+
+  req.user = data.user;
+  next();
+}
+
+/**
+ * Exige un utilisateur authentifié ET administrateur, en lisant son rôle en
+ * base. À utiliser pour les actions d'administration déclenchées depuis un
+ * navigateur, qui ne peut pas détenir ADMIN_SECRET. Le secret reste accepté
+ * pour les appels serveur-à-serveur et les scripts.
+ */
+async function requireAdminUser(req, res, next) {
+  if (ADMIN_SECRET && secretMatches(req.get('x-admin-secret'), ADMIN_SECRET)) {
+    return next();
+  }
+  return requireAuthenticatedUser(req, res, async () => {
+    const supabase = getSupabaseAdminClient();
+    if (!supabase) {
+      return res.status(503).json({ success: false, message: 'Vérification indisponible.' });
+    }
+    const { data } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    const role = String(data?.role || '').toLowerCase();
+    if (role !== 'admin' && role !== 'superadmin') {
+      return res.status(403).json({ success: false, message: "Action réservée à l'administration." });
+    }
+    next();
+  });
+}
+
+function requireWebhookSecret(secret, headerName) {
+  return (req, res, next) => {
+    if (!secret) {
+      return res.status(503).json({ success: false, message: 'Webhook non configuré.' });
+    }
+    // L'en-tête est le canal privilégié ; req.query.secret reste accepté en
+    // repli le temps que le prestataire soit reconfiguré (voir F16).
+    const candidate = req.get(headerName) || req.query.secret;
+    if (!secretMatches(candidate, secret)) {
+      return res.status(403).json({ success: false, message: 'Signature webhook invalide.' });
+    }
+    next();
+  };
+}
 
 // --- WEB PUSH CONFIGURATION (VAPID) ---
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
@@ -311,7 +433,8 @@ function calculateDeliveryFee(distanceKm) {
 }
 
 // --- Helpers ---
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
+// crypto.randomInt et non Math.random : cet OTP conditionne un virement.
+const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
 /**
  * Crée l'order + delivery_assignment UNIQUEMENT quand le paiement est confirmé.
@@ -459,7 +582,7 @@ app.get('/', (req, res) => {
 });
 
 // 0) Diagnostic : IP publique du serveur (accessible uniquement hors production ou avec secret admin)
-app.get('/ip', async (req, res) => {
+app.get('/ip', requireAdminSecret, async (req, res) => {
   if (process.env.NODE_ENV === 'production' && req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
     return res.status(403).json({ error: 'Accès non autorisé en production.' });
   }
@@ -476,7 +599,7 @@ app.get('/ip', async (req, res) => {
 });
 
 // 0b) Diagnostic : Désactivé en production pour des raisons de sécurité
-app.get('/config', (req, res) => {
+app.get('/config', requireAdminSecret, (req, res) => {
   if (process.env.NODE_ENV === 'production' && req.headers['x-admin-secret'] !== process.env.ADMIN_SECRET) {
     return res.status(403).json({ error: 'Accès au diagnostic désactivé en production.' });
   }
@@ -497,7 +620,7 @@ app.get('/health', (req, res) => {
 
 // 0d) Vérifier le statut d'un paiement (appelé par PaymentReturnPage)
 // Si la DB est encore en "pending", on interroge Money Fusion directement
-app.get('/check-payment', checkPaymentLimiter, async (req, res) => {
+app.get('/check-payment', requireAuthenticatedUser, checkPaymentLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -698,11 +821,11 @@ app.get('/check-payment', checkPaymentLimiter, async (req, res) => {
 // Pour les commandes (type='order'), on NE CRÉE PAS l'order en DB.
 // On crée uniquement l'escrow_transaction comme "intention de paiement".
 // L'order ne sera créé que quand Money Fusion confirme le paiement.
-app.post('/create-payment', createPaymentLimiter, async (req, res) => {
+app.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
   console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
-    const { type, amount, customerName, customerPhone, userId, metadata, orderInput } = req.body;
+    const { type, amount, customerName, customerPhone, userId, metadata, orderInput, orderInputs } = req.body;
     
     const allowedTypes = ['seller_badge', 'listing_pack_10', 'order', 'credits_pack_5', 'credits_pack_12', 'credits_pack_30'];
     if (!type || !allowedTypes.includes(type)) {
@@ -1026,6 +1149,27 @@ app.post('/payment-webhook', async (req, res) => {
 
     const fusionStatus = fusionData.data.statut;
 
+    // F17 : ne pas se contenter du statut « paid », vérifier aussi le MONTANT
+    // réellement encaissé. Sans ce contrôle, un paiement partiel validerait la
+    // commande pour une somme moindre. MoneyFusion nomme le champ tantôt
+    // `Montant`, tantôt `montant` selon l'endpoint : on lit les deux.
+    const paidAmountRaw = fusionData.data.Montant ?? fusionData.data.montant;
+    const paidAmount = Number(paidAmountRaw);
+    const expectedAmount = Number(tx.total_amount ?? tx.amount);
+
+    if (fusionStatus === 'paid' && Number.isFinite(paidAmount) && Number.isFinite(expectedAmount)
+        && paidAmount > 0 && paidAmount < expectedAmount) {
+      console.warn(
+        `webhook: paiement insuffisant tx=${transactionId} encaisse=${paidAmount} attendu=${expectedAmount}`
+      );
+      return res.json({
+        ok: true,
+        status: 'underpaid',
+        paid: paidAmount,
+        expected: expectedAmount,
+      });
+    }
+
     if (fusionStatus === 'paid') {
       if (isOrder) {
         // ✅ Paiement confirmé → MAINTENANT on crée l'order
@@ -1064,19 +1208,32 @@ app.post('/payment-webhook', async (req, res) => {
 const processingPayouts = new Set();
 
 // 3) Webhook de traitement des Payouts (peut être appelé par un cron)
-app.get('/process-payouts', payoutLimiter, async (req, res) => {
+// Cette route porte l'AUTOMATISME des virements : le client l'appelle en
+// « tire-et-oublie » juste après une livraison. Elle ne peut donc pas exiger un
+// secret d'administration, qu'un navigateur ne peut pas détenir.
+// Compromis retenu : un utilisateur authentifié suffit (le vendeur ou le livreur
+// qui vient de valider la remise), mais `?force=true` — qui court-circuite le
+// délai d'escrow — reste réservé à l'administration.
+// La garantie de fond est ailleurs : les lignes de `payouts` ne peuvent plus
+// être forgées (create_seller_payout / create_delivery_payout révoquées pour
+// anon et authenticated, et montants relus depuis l'escrow).
+app.get('/process-payouts', requireAuthenticatedUser, payoutLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
+    const isAdminCall = Boolean(ADMIN_SECRET) && secretMatches(req.get('x-admin-secret'), ADMIN_SECRET);
+    const forceRequested = req.query.force === 'true';
+    const force = forceRequested && isAdminCall;
+
     let query = supabase
       .from('payouts')
       .select('*')
       .eq('status', 'pending');
 
-    if (req.query.force !== 'true') {
+    if (!force) {
       query = query.lte('scheduled_for', new Date().toISOString());
     }
 
@@ -1084,7 +1241,15 @@ app.get('/process-payouts', payoutLimiter, async (req, res) => {
 
     if (error) throw error;
     if (!payouts || payouts.length === 0) {
-      return res.json({ success: true, message: req.query.force === 'true' ? 'Aucun payout de statut pending' : 'Aucun payout en attente (délai d\'escrow non expiré)', processed: 0 });
+      return res.json({
+        success: true,
+        message: force
+          ? 'Aucun payout de statut pending'
+          : 'Aucun payout en attente (délai d\'escrow non expiré)',
+        processed: 0,
+        forced: force,
+        force_ignored: forceRequested && !force,
+      });
     }
 
     const results = [];
@@ -1112,12 +1277,13 @@ app.get('/process-payouts', payoutLimiter, async (req, res) => {
       try {
         const host = req.get('host');
         const protocol = host.includes('localhost') || host.includes('127.0.0.1') ? 'http' : 'https';
+        const secretParam = PAYOUT_WEBHOOK_SECRET ? `?secret=${encodeURIComponent(PAYOUT_WEBHOOK_SECRET)}` : '';
         const payload = {
           countryCode: "ci",
           phone: payout.recipient_phone.replace(/\s/g, '').replace(/^\+225/, ''),
           amount: payout.amount,
           withdraw_mode: payout.withdraw_mode,
-          webhook_url: `${protocol}://${host}/payout-webhook`
+          webhook_url: `${protocol}://${host}/payout-webhook${secretParam}`
         };
 
         const response = await fetch('https://pay.moneyfusion.net/api/v1/withdraw', {
@@ -1155,7 +1321,7 @@ app.get('/process-payouts', payoutLimiter, async (req, res) => {
 });
 
 // 4) Webhook pour le résultat des Payouts
-app.post('/payout-webhook', async (req, res) => {
+app.post('/payout-webhook', requireWebhookSecret(PAYOUT_WEBHOOK_SECRET, 'x-payout-webhook-secret'), async (req, res) => {
   console.log('[Webhook Payout Received] Payload:', JSON.stringify(req.body));
   try {
     checkConfig();
@@ -1251,7 +1417,7 @@ app.post('/payout-webhook', async (req, res) => {
 // ========================================
 
 // A. Broadcast vers tous les appareils abonnés (Admin / Annonces globales)
-app.post('/push/broadcast', async (req, res) => {
+app.post('/push/broadcast', requireAdminUser, async (req, res) => {
   try {
     const { title, body, url, tag, image } = req.body || {};
     if (!title || !body) {
@@ -1290,7 +1456,7 @@ app.post('/push/broadcast', async (req, res) => {
 });
 
 // B. Notification ciblée pour un utilisateur spécifique (Messages chat, commandes)
-app.post('/push/notify-user', async (req, res) => {
+app.post('/push/notify-user', requireAuthenticatedUser, async (req, res) => {
   try {
     const { targetUserId, title, body, url, tag, image } = req.body || {};
     if (!targetUserId || !title || !body) {
@@ -1315,7 +1481,7 @@ app.post('/push/notify-user', async (req, res) => {
 });
 
 // C. Endpoint générique /push/send
-app.post('/push/send', async (req, res) => {
+app.post('/push/send', requireAdminSecret, async (req, res) => {
   try {
     const { target, title, body, url, tag } = req.body || {};
     if (!title || !body) {
@@ -1354,12 +1520,16 @@ app.post('/push/send', async (req, res) => {
 });
 
 // E. Register Push Subscription (Web Push ou Mobile Expo Push)
-app.post('/push/register', async (req, res) => {
+app.post('/push/register', requireAuthenticatedUser, async (req, res) => {
   try {
-    const { user_id, expo_push_token, app_type, endpoint, keys_p256dh, keys_auth, user_agent } = req.body || {};
+    const { expo_push_token, app_type, endpoint, keys_p256dh, keys_auth, user_agent } = req.body || {};
 
-    if (!user_id || (!expo_push_token && (!endpoint || !keys_p256dh || !keys_auth))) {
-      return res.status(400).json({ success: false, message: 'Champs requis manquants: user_id et (expo_push_token OU endpoint/keys)' });
+    // L'utilisateur vient du jeton, jamais du corps de la requête : on ne peut
+    // plus enregistrer un abonnement push au nom de quelqu'un d'autre.
+    const user_id = req.user.id;
+
+    if (!expo_push_token && (!endpoint || !keys_p256dh || !keys_auth)) {
+      return res.status(400).json({ success: false, message: 'Champs requis manquants: expo_push_token OU endpoint/keys' });
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -1417,7 +1587,7 @@ app.post('/push/register', async (req, res) => {
 });
 
 // D. Webhook Supabase Database Trigger (Notifications automatiques en arrière-plan)
-app.post('/push/webhook', async (req, res) => {
+app.post('/push/webhook', requireWebhookSecret(PUSH_WEBHOOK_SECRET, 'x-push-webhook-secret'), async (req, res) => {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
     return res.status(503).json({ ok: false, error: 'Push VAPID keys non configurées' });
   }
@@ -1606,7 +1776,7 @@ app.post('/push/webhook', async (req, res) => {
 });
 
 // --- WhatsApp Channel Broadcast Endpoint (Levier A & Diffusion automatique) ---
-app.post('/api/channel/broadcast-listing', async (req, res) => {
+app.post('/api/channel/broadcast-listing', requireAdminSecret, async (req, res) => {
   try {
     const { title, price, district, id, shop_name } = req.body;
     if (!title || !price || !id) {
