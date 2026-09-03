@@ -326,78 +326,132 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
 
   const meta = escrow.order_metadata || {};
 
-  // Créer l'order
-  const { data: order, error: orderErr } = await supabase
-    .from('orders')
-    .insert({
-      buyer_id: escrow.buyer_id,
-      seller_id: escrow.seller_id,
-      listing_id: meta.listing_id,
-      variant_id: meta.variant_id || null,
-      variant_label: meta.variant_label || null,
-      unit_price: meta.unit_price || null,
-      quantity: Math.max(1, Number(meta.quantity) || 1),
-      product_amount: meta.product_amount || (escrow.total_amount - escrow.delivery_fee - escrow.platform_fee),
-      delivery_fee: escrow.delivery_fee,
-      platform_commission: escrow.platform_fee,
-      total_amount: escrow.total_amount,
-      delivery_address: meta.delivery_address || personalInfo?.delivery_address || 'Daloa',
-      delivery_mode: meta.delivery_mode || personalInfo?.delivery_mode || 'delivery',
-      status: 'paid'  // ← directement "paid" puisque le paiement est confirmé
-    })
-    .select('id')
-    .single();
+  // Multi-articles : meta.items[] (un panier de plusieurs vendeurs).
+  // Rétro-compat mono-article : on enveloppe la meta elle-même dans un tableau.
+  const rawItems =
+    Array.isArray(meta.items) && meta.items.length > 0 ? meta.items : [meta];
+  const isLegacySingle = rawItems.length === 1 && meta.items == null;
 
-  if (orderErr || !order) {
-    console.error('Order creation error:', orderErr);
-    throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
+  // Valeurs effectives par article (rétro-compat : mono-article legacy lit l'escrow).
+  const items = rawItems.map((i) => ({
+    listing_id: i.listing_id,
+    seller_id: i.seller_id || escrow.seller_id,
+    variant_id: i.variant_id || null,
+    variant_label: i.variant_label || null,
+    unit_price: i.unit_price || null,
+    quantity: Math.max(1, Number(i.quantity) || 1),
+    product_amount:
+      i.product_amount != null
+        ? i.product_amount
+        : isLegacySingle
+        ? escrow.total_amount - (escrow.delivery_fee || 0) - (escrow.platform_fee || 0)
+        : 0,
+    delivery_fee: i.delivery_fee != null ? i.delivery_fee : isLegacySingle ? escrow.delivery_fee || 0 : 0,
+    platform_fee: i.platform_fee != null ? i.platform_fee : isLegacySingle ? escrow.platform_fee || 0 : 0,
+  }));
+
+  const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
+  const deliveryMode = meta.delivery_mode || personalInfo?.delivery_mode || 'delivery';
+  const isPickup = deliveryMode === 'pickup_point' || deliveryMode === 'pickup';
+
+  // ── Regrouper par vendeur → UNE commande par vendeur, plusieurs order_items ──
+  const groups = new Map();
+  for (const it of items) {
+    if (!groups.has(it.seller_id)) groups.set(it.seller_id, []);
+    groups.get(it.seller_id).push(it);
   }
 
-  // Lier l'escrow à l'order
-  await supabase
-    .from('escrow_transactions')
-    .update({ order_id: order.id, status: 'funded', funded_at: new Date().toISOString() })
-    .eq('id', escrow.id);
+  let firstOrderId = null;
 
-  // Créer delivery_assignment
-  const pickupOTP = generateOTP();
-  const deliveryOTP = generateOTP();
-  const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
-  const deliveryLat = meta.delivery_lat || personalInfo?.delivery_lat || null;
-  const deliveryLng = meta.delivery_lng || personalInfo?.delivery_lng || null;
-  const distanceKm = meta.distance_km || null;
-  const isPickup = (meta.delivery_mode || personalInfo?.delivery_mode) === 'pickup_point' || (meta.delivery_mode || personalInfo?.delivery_mode) === 'pickup';
+  for (const [sellerId, group] of groups.entries()) {
+    const productAmount = group.reduce((s, i) => s + (i.product_amount || 0), 0);
+    const deliveryFee = group.reduce((s, i) => s + (i.delivery_fee || 0), 0);
+    const platformFee = group.reduce((s, i) => s + (i.platform_fee || 0), 0);
+    const totalQuantity = group.reduce((s, i) => s + i.quantity, 0);
+    const orderTotal = productAmount + deliveryFee + platformFee;
+    const first = group[0];
 
-  await supabase.from('delivery_assignments').insert({
-    order_id: order.id,
-    delivery_person_id: null,
-    status: 'pending_seller_confirmation',
-    pickup_confirmed_by_seller: isPickup,
-    pickup_otp: pickupOTP,
-    delivery_otp: deliveryOTP,
-    pickup_otp_attempts: 0,
-    delivery_otp_attempts: 0,
-    pickup_location: 'Boutique du vendeur',
-    dropoff_location: address || 'Retrait en boutique',
-    delivery_price: escrow.delivery_fee || 0,
-    seller_id: escrow.seller_id,
-    is_private: isPickup,
-  });
+    // 1. Header de commande (par vendeur). listing_id = 1er article (NOT NULL).
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .insert({
+        buyer_id: escrow.buyer_id,
+        seller_id: sellerId,
+        listing_id: first.listing_id,
+        variant_id: first.variant_id,
+        variant_label: first.variant_label,
+        unit_price: first.unit_price,
+        quantity: totalQuantity,
+        product_amount: productAmount,
+        delivery_fee: deliveryFee,
+        platform_commission: platformFee,
+        total_amount: orderTotal,
+        delivery_address: address,
+        delivery_mode: deliveryMode,
+        status: 'paid',
+      })
+      .select('id')
+      .single();
 
-  // Notification push au vendeur
-  if (escrow.seller_id) {
-    supabase.from('listings').select('title').eq('id', meta.listing_id).maybeSingle().then(({ data: l }) => {
-      const itemTitle = l?.title || 'Votre article';
-      sendPushToUser(escrow.seller_id, {
+    if (orderErr || !order) {
+      console.error('Order creation error:', orderErr);
+      throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
+    }
+    if (!firstOrderId) firstOrderId = order.id;
+
+    // 2. Lignes d'articles (order_items)
+    const itemsPayload = group.map((i) => ({
+      order_id: order.id,
+      listing_id: i.listing_id,
+      variant_id: i.variant_id,
+      variant_label: i.variant_label,
+      unit_price: i.unit_price || 0,
+      quantity: i.quantity,
+      product_amount: i.product_amount || 0,
+    }));
+    const { error: itemsErr } = await supabase.from('order_items').insert(itemsPayload);
+    if (itemsErr) {
+      console.error('order_items creation error:', itemsErr.message);
+    }
+
+    // 3. UNE livraison par vendeur (1 OTP, 1 transport)
+    const pickupOTP = generateOTP();
+    const deliveryOTP = generateOTP();
+    await supabase.from('delivery_assignments').insert({
+      order_id: order.id,
+      delivery_person_id: null,
+      status: 'pending_seller_confirmation',
+      pickup_confirmed_by_seller: isPickup,
+      pickup_otp: pickupOTP,
+      delivery_otp: deliveryOTP,
+      pickup_otp_attempts: 0,
+      delivery_otp_attempts: 0,
+      pickup_location: 'Boutique du vendeur',
+      dropoff_location: address || 'Retrait en boutique',
+      delivery_price: deliveryFee || 0,
+      seller_id: sellerId,
+      is_private: isPickup,
+    });
+
+    // 4. Notification push au vendeur
+    if (sellerId) {
+      const count = group.length;
+      sendPushToUser(sellerId, {
         title: '🎉 Nouvelle commande reçue !',
-        body: `Vous avez vendu "${itemTitle}" pour ${Number(escrow.total_amount || 0).toLocaleString('fr-FR')} FCFA.`,
+        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} pour ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA.`,
         url: `/mes-commandes`,
         tag: `order-${order.id}`,
       }).catch(e => console.error('[Push Order Error]:', e));
-    });
+    }
   }
 
-  return order.id;
+  // Lier l'escrow au premier order créé (idempotence sur les relances)
+  await supabase
+    .from('escrow_transactions')
+    .update({ order_id: firstOrderId, status: 'funded', funded_at: new Date().toISOString() })
+    .eq('id', escrow.id);
+
+  return firstOrderId;
 }
 
 app.get('/', (req, res) => {
@@ -682,130 +736,142 @@ app.post('/create-payment', createPaymentLimiter, async (req, res) => {
     let finalAmount = amount;
     
     if (type === 'order') {
-      // 1. Lire la db pour le prix de l'article + coordonnées vendeur
-      let listing = null;
-      let listingErr = null;
+      // Multi-articles : accepte orderInputs[] (panier). Rétro-compat : orderInput seul.
+      const rawItems = Array.isArray(orderInputs) && orderInputs.length > 0
+        ? orderInputs
+        : (orderInput ? [orderInput] : []);
 
-      const rawListingId = orderInput?.listing_id;
-      if (rawListingId) {
-        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawListingId);
-        if (isUUID) {
-          const res = await supabase
-            .from('listings')
-            .select('id, price, user_id, stock, status, variants')
-            .eq('id', rawListingId)
-            .maybeSingle();
-          listing = res.data;
-          listingErr = res.error;
+      if (rawItems.length === 0) {
+        return res.status(400).json({ success: false, message: 'Aucun article à commander.' });
+      }
+
+      const metaItems = [];
+      let grandTotal = 0;
+      const sellersCharged = new Set(); // transport facturé une seule fois par vendeur
+
+      for (const oi of rawItems) {
+        // 1. Résoudre l'annonce (UUID exact ou préfixe court)
+        let listing = null;
+        const rawListingId = oi?.listing_id;
+        if (rawListingId) {
+          const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawListingId);
+          if (isUUID) {
+            const r = await supabase
+              .from('listings')
+              .select('id, price, user_id, stock, status, variants')
+              .eq('id', rawListingId)
+              .maybeSingle();
+            listing = r.data;
+          }
+          if (!listing) {
+            const r = await supabase
+              .from('listings')
+              .select('id, price, user_id, stock, status, variants')
+              .ilike('id', `${rawListingId}%`)
+              .limit(1)
+              .maybeSingle();
+            if (r.data) listing = r.data;
+          }
         }
 
         if (!listing) {
-          // Fallback : recherche par short ID ou préfixe (ex: a1b2c3d4)
-          const res = await supabase
-            .from('listings')
-            .select('id, price, user_id, stock, status, variants')
-            .ilike('id', `${rawListingId}%`)
-            .limit(1)
-            .maybeSingle();
-          if (res.data) {
-            listing = res.data;
-            listingErr = null;
-          }
+          return res.status(404).json({ success: false, message: `Article introuvable (${rawListingId || '?'})` });
         }
+        if (listing.status !== 'active') {
+          return res.status(409).json({ success: false, message: 'Un article du panier n’est plus disponible.' });
+        }
+
+        const quantity = Math.max(1, Math.floor(Number(oi?.quantity) || 1));
+        const variants = Array.isArray(listing.variants) ? listing.variants : [];
+        const selectedVariant = oi?.variant_id ? variants.find((v) => v.id === oi.variant_id) : null;
+
+        if (variants.length > 0 && (!selectedVariant || selectedVariant.active === false)) {
+          return res.status(400).json({ success: false, message: 'Veuillez choisir une taille valide.' });
+        }
+
+        const availableStock = selectedVariant ? Number(selectedVariant.stock) || 0 : Number(listing.stock) || 0;
+        if (availableStock < quantity) {
+          return res.status(409).json({ success: false, message: 'La quantité demandée n’est plus disponible.' });
+        }
+
+        const unitPrice = selectedVariant?.price != null ? Number(selectedVariant.price) : Number(listing.price);
+        if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+          return res.status(400).json({ success: false, message: 'Prix de l’article invalide.' });
+        }
+        const productAmount = unitPrice * quantity;
+
+        // Profil vendeur (PRO + coordonnées boutique)
+        const { data: sellerProfile } = await supabase
+          .from('users')
+          .select('pro_until, shop_latitude, shop_longitude')
+          .eq('id', listing.user_id)
+          .single();
+        const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
+        const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
+
+        // Distance + frais de livraison PAR VENDEUR (une seule fois par vendeur)
+        const deliveryLat = oi.delivery_lat || null;
+        const deliveryLng = oi.delivery_lng || null;
+        const sellerLat = sellerProfile?.shop_latitude || null;
+        const sellerLng = sellerProfile?.shop_longitude || null;
+        let distanceKm = 0;
+        if (deliveryLat != null && deliveryLng != null && sellerLat != null && sellerLng != null) {
+          distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
+        }
+        const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
+        const alreadyCharged = sellersCharged.has(listing.user_id);
+        const deliveryFee = (isPickupMode || alreadyCharged) ? 0 : calculateDeliveryFee(distanceKm);
+        if (!isPickupMode) sellersCharged.add(listing.user_id);
+
+        const commission = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
+        const sellerCommission = Math.round(productAmount * sellerFeeRate);
+        const itemTotal = productAmount + deliveryFee + commission;
+        grandTotal += itemTotal;
+
+        metaItems.push({
+          listing_id: listing.id,
+          seller_id: listing.user_id,
+          variant_id: selectedVariant?.id || null,
+          variant_label: selectedVariant?.label || null,
+          unit_price: unitPrice,
+          quantity,
+          product_amount: productAmount,
+          delivery_fee: deliveryFee,
+          platform_fee: commission,
+          seller_amount: productAmount - sellerCommission,
+          delivery_address: oi.delivery_address || 'Daloa',
+          delivery_mode: oi.delivery_mode || 'delivery',
+          delivery_lat: deliveryLat,
+          delivery_lng: deliveryLng,
+          distance_km: Math.round(distanceKm * 10) / 10,
+        });
       }
 
-      if (listingErr || !listing) {
-        console.error('Listing lookup error:', listingErr, 'listing_id provided:', rawListingId);
-        return res.status(404).json({ success: false, message: 'Article introuvable' });
-      }
-      
-      if (listing.status !== 'active') {
-        return res.status(409).json({ success: false, message: 'Cette annonce n’est plus disponible.' });
-      }
+      finalAmount = grandTotal;
+      console.log(`Order pricing (multi): items=${metaItems.length}, sellers=${sellersCharged.size}, total=${finalAmount}F`);
 
-      const quantity = Math.max(1, Math.floor(Number(orderInput?.quantity) || 1));
-      const variants = Array.isArray(listing.variants) ? listing.variants : [];
-      const selectedVariant = orderInput?.variant_id
-        ? variants.find((variant) => variant.id === orderInput.variant_id)
-        : null;
-
-      if (variants.length > 0 && (!selectedVariant || selectedVariant.active === false)) {
-        return res.status(400).json({ success: false, message: 'Veuillez choisir une taille valide.' });
-      }
-
-      const availableStock = selectedVariant ? Number(selectedVariant.stock) || 0 : Number(listing.stock) || 0;
-      if (availableStock < quantity) {
-        return res.status(409).json({ success: false, message: 'La quantité demandée n’est plus disponible pour cette taille.' });
-      }
-
-      const unitPrice = selectedVariant?.price != null ? Number(selectedVariant.price) : Number(listing.price);
-      if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-        return res.status(400).json({ success: false, message: 'Prix de l’article invalide.' });
-      }
-      const productAmount = unitPrice * quantity;
-
-      // Récupérer le profil du vendeur (statut PRO + coordonnées boutique)
-      const { data: sellerProfile } = await supabase
-        .from('users')
-        .select('pro_until, shop_latitude, shop_longitude')
-        .eq('id', listing.user_id)
-        .single();
-        
-      const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
-      // En Phase 0 : 0% de commission vendeur pour maximiser l'adoption
-      const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
-      
-      // Calcul dynamique de la distance et des frais de livraison
-      const deliveryLat = orderInput.delivery_lat || null;
-      const deliveryLng = orderInput.delivery_lng || null;
-      const sellerLat = sellerProfile?.shop_latitude || null;
-      const sellerLng = sellerProfile?.shop_longitude || null;
-      
-      let distanceKm = 0;
-      if (deliveryLat != null && deliveryLng != null && sellerLat != null && sellerLng != null) {
-        distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
-      }
-      
-      const isPickupMode = orderInput?.delivery_mode === 'pickup' || orderInput?.delivery_mode === 'pickup_point';
-      const deliveryFee = isPickupMode ? 0 : calculateDeliveryFee(distanceKm);
-      const commission = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
-      const sellerCommission = Math.round(productAmount * sellerFeeRate);
-      finalAmount = productAmount + deliveryFee + commission;
-      
-      console.log(`Order pricing: quantity=${quantity}, unitPrice=${unitPrice}F, distance=${distanceKm.toFixed(1)}km, deliveryFee=${deliveryFee}F, total=${finalAmount}F`);
-      
-      // 2. Créer UNIQUEMENT l'escrow_transaction (PAS d'order)
-      // L'escrow stocke les métadonnées nécessaires pour créer l'order plus tard
+      // Un SEUL escrow porte tout le panier ; les N commandes sont créées à la confirmation.
       const { data: escrow, error: escrowErr } = await supabase
         .from('escrow_transactions')
         .insert({
-          order_id: null,  // ← PAS d'order pour l'instant
+          order_id: null,
           buyer_id: userId,
-          seller_id: listing.user_id,
+          seller_id: metaItems[0].seller_id,
           total_amount: finalAmount,
-          seller_amount: productAmount - sellerCommission,
-          delivery_fee: deliveryFee,
-          platform_fee: commission,
+          seller_amount: metaItems.reduce((s, i) => s + i.seller_amount, 0),
+          delivery_fee: metaItems.reduce((s, i) => s + i.delivery_fee, 0),
+          platform_fee: metaItems.reduce((s, i) => s + i.platform_fee, 0),
           status: 'pending',
           payment_method: 'mobile_money',
           order_metadata: {
-            listing_id: listing.id,
-            variant_id: selectedVariant?.id || null,
-            variant_label: selectedVariant?.label || null,
-            unit_price: unitPrice,
-            quantity,
-            product_amount: productAmount,
-            delivery_address: orderInput.delivery_address || 'Daloa',
-            delivery_mode: orderInput.delivery_mode || 'delivery',
-            delivery_lat: deliveryLat,
-            delivery_lng: deliveryLng,
-            distance_km: Math.round(distanceKm * 10) / 10,
-            delivery_fee_calculated: deliveryFee,
-          }
+            items: metaItems,
+            delivery_address: metaItems[0].delivery_address,
+            delivery_mode: metaItems[0].delivery_mode,
+          },
         })
         .select('id')
         .single();
-        
+
       if (escrowErr || !escrow) {
         console.error('Escrow creation error:', escrowErr);
         return res.status(500).json({ success: false, message: escrowErr?.message || 'Erreur création escrow' });
