@@ -46,20 +46,55 @@ const payoutLimiter = rateLimit({
   message: { success: false, message: 'Limite de traitement de payouts atteinte.' }
 });
 
-app.use(globalLimiter);
+// --- CORS CONFIGURATION (placé AVANT les rate limiters pour toujours répondre aux preflights) ---
+const DEFAULT_ALLOWED = [
+  'https://daloamarket.com',
+  'https://www.daloamarket.com',
+  'https://delivery.daloamarket.com',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+  'http://localhost:8081',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+];
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://daloamarket.com,https://delivery.daloamarket.com')
+const customOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
 
-app.use(cors({
+const allowedOriginsList = [...new Set([...DEFAULT_ALLOWED, ...customOrigins])];
+
+const isOriginAllowed = (origin) => {
+  // Pas d'origine = webhooks MoneyFusion / appels serveur-à-serveur
+  if (!origin) return true;
+  if (allowedOriginsList.includes(origin)) return true;
+  // Déploiements preview Netlify
+  if (/^https:\/\/([a-z0-9-]+--)?daloamarket.*\.netlify\.app$/i.test(origin)) return true;
+  // Localhost sur tout port de développement
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return true;
+  return false;
+};
+
+const corsOptions = {
   origin(origin, callback) {
-    // Pas d'origine = appel serveur-a-serveur (webhooks MoneyFusion) : autorise.
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error('Origine non autorisee'));
+    if (isOriginAllowed(origin)) {
+      return callback(null, true);
+    }
+    console.warn(`[CORS] Origine bloquée : ${origin}`);
+    return callback(null, false);
   },
-}));
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-secret', 'X-Requested-With', 'Accept'],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+app.use(globalLimiter);
 app.use(express.json());
 
 // Contrôle du bannissement d'IP (absent de ce serveur : la fonctionnalité,
