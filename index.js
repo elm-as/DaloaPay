@@ -127,6 +127,59 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   console.warn('[WebPush Warning] VAPID_PUBLIC_KEY or VAPID_PRIVATE_KEY is missing from environment variables.');
 }
 
+async function sendExpoPush(expoPushToken, payload) {
+  try {
+    if (!expoPushToken || !expoPushToken.startsWith('ExponentPushToken[')) {
+      return { success: false, message: 'Format token Expo invalide' };
+    }
+
+    const expoMessage = {
+      to: expoPushToken,
+      sound: 'default',
+      title: payload.title,
+      body: payload.body,
+      data: {
+        url: payload.url || '/',
+        tag: payload.tag,
+        orderId: payload.orderId || (payload.url && payload.url.includes('/suivi/') ? payload.url.split('/suivi/')[1] : null),
+        chatPartnerId: payload.chatPartnerId || (payload.url && payload.url.includes('/messages/') ? payload.url.split('/messages/')[1] : null),
+      },
+      priority: 'high',
+      channelId: 'default',
+    };
+
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Accept-encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(expoMessage),
+    });
+
+    const data = await res.json();
+    if (data?.data?.status === 'ok') {
+      return { success: true };
+    } else {
+      console.warn('[ExpoPush] Push send warning:', data?.data?.message || data?.errors);
+      return { success: false, error: data?.data?.message };
+    }
+  } catch (err) {
+    console.error('[ExpoPush] Exception:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+async function dispatchPush(sub, payload) {
+  if (sub.expo_push_token) {
+    return sendExpoPush(sub.expo_push_token, payload);
+  } else if (sub.endpoint) {
+    return sendWebPush(sub, payload);
+  }
+  return { success: false, message: 'Aucun token valide' };
+}
+
 async function sendWebPush(subscription, payload) {
   try {
     const pushSubscription = {
@@ -172,22 +225,22 @@ async function sendPushToUser(userId, payload) {
       .eq('user_id', userId);
 
     if (error) {
-      console.error(`[WebPush] Erreur DB pour user ${userId}:`, error.message);
+      console.error(`[Push] Erreur DB pour user ${userId}:`, error.message);
       return { success: false, error: error.message };
     }
 
     if (!subs || subs.length === 0) {
-      console.log(`[WebPush] ⚠️ Aucun abonnement push trouvé en base pour l'utilisateur ${userId}.`);
+      console.log(`[Push] ⚠️ Aucun abonnement push trouvé en base pour l'utilisateur ${userId}.`);
       return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
     }
 
-    console.log(`[WebPush] 🚀 Envoi de la notification à ${subs.length} appareil(s) pour l'utilisateur ${userId}...`);
-    const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
+    console.log(`[Push] 🚀 Envoi de la notification à ${subs.length} appareil(s) pour l'utilisateur ${userId}...`);
+    const results = await Promise.allSettled(subs.map(sub => dispatchPush(sub, payload)));
     const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
-    console.log(`[WebPush] ✅ Résultat envoi user ${userId}: ${sentCount}/${subs.length} délivré(s).`);
+    console.log(`[Push] ✅ Résultat envoi user ${userId}: ${sentCount}/${subs.length} délivré(s).`);
     return { success: true, sent: sentCount, total: subs.length };
   } catch (err) {
-    console.error('[WebPush] sendPushToUser failed:', err);
+    console.error('[Push] sendPushToUser failed:', err);
     return { success: false, error: err.message };
   }
 }
@@ -205,11 +258,11 @@ async function broadcastPush(payload) {
       return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
-    const results = await Promise.allSettled(subs.map(sub => sendWebPush(sub, payload)));
+    const results = await Promise.allSettled(subs.map(sub => dispatchPush(sub, payload)));
     const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
     return { success: true, sent: sentCount, total: subs.length };
   } catch (err) {
-    console.error('[WebPush] broadcastPush failed:', err);
+    console.error('[Push] broadcastPush failed:', err);
     return { success: false, error: err.message };
   }
 }
@@ -1234,21 +1287,42 @@ app.post('/push/send', async (req, res) => {
   }
 });
 
-// E. Register Push Subscription (called by frontend — uses service_role to bypass RLS)
+// E. Register Push Subscription (Web Push ou Mobile Expo Push)
 app.post('/push/register', async (req, res) => {
   try {
-    const { user_id, endpoint, keys_p256dh, keys_auth, user_agent } = req.body || {};
+    const { user_id, expo_push_token, app_type, endpoint, keys_p256dh, keys_auth, user_agent } = req.body || {};
 
-    if (!user_id || !endpoint || !keys_p256dh || !keys_auth) {
-      console.log('[Push Register] ❌ Champs manquants:', { user_id: !!user_id, endpoint: !!endpoint, keys_p256dh: !!keys_p256dh, keys_auth: !!keys_auth });
-      return res.status(400).json({ success: false, message: 'Champs requis: user_id, endpoint, keys_p256dh, keys_auth' });
+    if (!user_id || (!expo_push_token && (!endpoint || !keys_p256dh || !keys_auth))) {
+      return res.status(400).json({ success: false, message: 'Champs requis manquants: user_id et (expo_push_token OU endpoint/keys)' });
     }
 
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Insérer ou mettre à jour la souscription (gère la concurrence sans crash)
+    // Cas 1 : Token Mobile Expo (Android / iOS)
+    if (expo_push_token) {
+      const { error } = await supabase.from('push_subscriptions').upsert(
+        {
+          user_id,
+          expo_push_token,
+          app_type: app_type || 'market',
+          is_active: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id,expo_push_token' }
+      );
+
+      if (error && error.code !== '23505') {
+        console.error('[Push Register Expo] ❌ Erreur insertion Supabase:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+      }
+
+      console.log(`[Push Register Expo] ✅ Token Expo enregistré pour user ${user_id} (${app_type || 'market'})`);
+      return res.json({ success: true, type: 'expo' });
+    }
+
+    // Cas 2 : Web Push
     const { error } = await supabase.from('push_subscriptions').upsert(
       {
         user_id,
@@ -1268,8 +1342,8 @@ app.post('/push/register', async (req, res) => {
       return res.status(500).json({ success: false, message: error.message });
     }
 
-    console.log(`[Push Register] ✅ Token enregistré pour user ${user_id} (endpoint: ${endpoint.slice(0, 60)}...)`);
-    return res.json({ success: true });
+    console.log(`[Push Register] ✅ Token Web enregistré pour user ${user_id} (endpoint: ${endpoint.slice(0, 60)}...)`);
+    return res.json({ success: true, type: 'web' });
   } catch (err) {
     console.error('[Push Register] Exception:', err);
     return res.status(500).json({ success: false, message: err.message });
