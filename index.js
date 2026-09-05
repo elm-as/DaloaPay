@@ -391,11 +391,19 @@ async function sendPushToUser(userId, payload) {
       return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
     }
 
-    console.log(`[Push] 🚀 Envoi de la notification à ${subs.length} appareil(s) pour l'utilisateur ${userId}...`);
-    const results = await Promise.allSettled(subs.map(sub => dispatchPush(sub, payload)));
-    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
-    console.log(`[Push] ✅ Résultat envoi user ${userId}: ${sentCount}/${subs.length} délivré(s).`);
-    return { success: true, sent: sentCount, total: subs.length };
+    console.log(`[Push] 🚀 Envoi de la notification à ${subs.length} abonnement(s) pour l'utilisateur ${userId}...`);
+    const seen = new Set();
+    const uniqueSubs = subs.filter(sub => {
+      const key = sub.expo_push_token || sub.endpoint;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const results = await Promise.allSettled(uniqueSubs.map(sub => dispatchPush(sub, payload)));
+    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
+    console.log(`[Push] ✅ Résultat envoi user ${userId}: ${sentCount}/${uniqueSubs.length} délivré(s).`);
+    return { success: true, sent: sentCount, total: uniqueSubs.length };
   } catch (err) {
     console.error('[Push] sendPushToUser failed:', err);
     return { success: false, error: err.message };
@@ -415,9 +423,17 @@ async function broadcastPush(payload) {
       return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
-    const results = await Promise.allSettled(subs.map(sub => dispatchPush(sub, payload)));
-    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
-    return { success: true, sent: sentCount, total: subs.length };
+    const seen = new Set();
+    const uniqueSubs = subs.filter(sub => {
+      const key = sub.expo_push_token || sub.endpoint;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const results = await Promise.allSettled(uniqueSubs.map(sub => dispatchPush(sub, payload)));
+    const sentCount = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
+    return { success: true, sent: sentCount, total: uniqueSubs.length };
   } catch (err) {
     console.error('[Push] broadcastPush failed:', err);
     return { success: false, error: err.message };
