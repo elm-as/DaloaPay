@@ -379,7 +379,9 @@ async function sendPushToUser(userId, payload) {
     const { data: subs, error } = await supabase
       .from('push_subscriptions')
       .select('*')
-      .eq('user_id', userId);
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('updated_at', { ascending: false });
 
     if (error) {
       console.error(`[Push] Erreur DB pour user ${userId}:`, error.message);
@@ -391,14 +393,32 @@ async function sendPushToUser(userId, payload) {
       return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
     }
 
-    console.log(`[Push] 🚀 Envoi de la notification à ${subs.length} abonnement(s) pour l'utilisateur ${userId}...`);
-    const seen = new Set();
-    const uniqueSubs = subs.filter(sub => {
-      const key = sub.expo_push_token || sub.endpoint;
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    console.log(`[Push] 🚀 Envoi de la notification pour l'utilisateur ${userId}...`);
+    // Déduplication absolue anti-doublon :
+    // 1 seul token Expo par type d'app (le plus récent), 1 seul WebPush par endpoint
+    const seenExpoApps = new Set();
+    const seenEndpoints = new Set();
+    const uniqueSubs = [];
+
+    for (const sub of subs) {
+      if (sub.expo_push_token) {
+        const appKey = sub.app_type || 'market';
+        if (!seenExpoApps.has(appKey)) {
+          seenExpoApps.add(appKey);
+          uniqueSubs.push(sub);
+        }
+      } else if (sub.endpoint) {
+        // Ne pas envoyer de WebPush mobile si l'utilisateur a déjà reçu le push via l'app native Expo
+        const isMobileWeb = sub.user_agent && (sub.user_agent.includes('Android') || sub.user_agent.includes('Mobile'));
+        if (isMobileWeb && seenExpoApps.size > 0) {
+          continue;
+        }
+        if (!seenEndpoints.has(sub.endpoint)) {
+          seenEndpoints.add(sub.endpoint);
+          uniqueSubs.push(sub);
+        }
+      }
+    }
 
     const results = await Promise.allSettled(uniqueSubs.map(sub => dispatchPush(sub, payload)));
     const sentCount = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
@@ -417,19 +437,33 @@ async function broadcastPush(payload) {
     });
     const { data: subs, error } = await supabase
       .from('push_subscriptions')
-      .select('*');
+      .select('*')
+      .eq('is_active', true)
+      .order('updated_at', { ascending: false });
 
     if (error || !subs || subs.length === 0) {
       return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
-    const seen = new Set();
-    const uniqueSubs = subs.filter(sub => {
-      const key = sub.expo_push_token || sub.endpoint;
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    // Déduplication par utilisateur et par canal pour éviter qu'un utilisateur reçoive plusieurs fois
+    const seenUserApp = new Set();
+    const seenEndpoints = new Set();
+    const uniqueSubs = [];
+
+    for (const sub of subs) {
+      if (sub.expo_push_token) {
+        const key = `${sub.user_id}_${sub.app_type || 'market'}`;
+        if (!seenUserApp.has(key)) {
+          seenUserApp.add(key);
+          uniqueSubs.push(sub);
+        }
+      } else if (sub.endpoint) {
+        if (!seenEndpoints.has(sub.endpoint)) {
+          seenEndpoints.add(sub.endpoint);
+          uniqueSubs.push(sub);
+        }
+      }
+    }
 
     const results = await Promise.allSettled(uniqueSubs.map(sub => dispatchPush(sub, payload)));
     const sentCount = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
