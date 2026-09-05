@@ -290,6 +290,32 @@ async function sendExpoPush(expoPushToken, payload) {
       return { success: false, message: 'Format token Expo invalide' };
     }
 
+    // Extraction robuste du partnerId, listingId et orderId
+    let chatPartnerId = payload.chatPartnerId || null;
+    let listingId = payload.listingId || null;
+    let orderId = payload.orderId || null;
+
+    if (payload.url) {
+      if (!chatPartnerId && payload.url.includes('/messages/')) {
+        const parts = payload.url.split('/messages/')[1].split('/').filter(Boolean);
+        // Format habituel: /messages/:listingId/:partnerId
+        if (parts.length >= 2) {
+          listingId = listingId || parts[0];
+          chatPartnerId = parts[1];
+        } else if (parts.length === 1) {
+          chatPartnerId = parts[0];
+        }
+      }
+
+      if (!orderId) {
+        if (payload.url.includes('/suivi/')) {
+          orderId = payload.url.split('/suivi/')[1].split('/')[0] || null;
+        } else if (payload.url.includes('/order/')) {
+          orderId = payload.url.split('/order/')[1].split('/')[0] || null;
+        }
+      }
+    }
+
     const expoMessage = {
       to: expoPushToken,
       sound: 'default',
@@ -298,8 +324,9 @@ async function sendExpoPush(expoPushToken, payload) {
       data: {
         url: payload.url || '/',
         tag: payload.tag,
-        orderId: payload.orderId || (payload.url && payload.url.includes('/suivi/') ? payload.url.split('/suivi/')[1] : null),
-        chatPartnerId: payload.chatPartnerId || (payload.url && payload.url.includes('/messages/') ? payload.url.split('/messages/')[1] : null),
+        orderId,
+        chatPartnerId,
+        listingId,
       },
       priority: 'high',
       channelId: 'default',
