@@ -1580,7 +1580,7 @@ app.post('/push/broadcast', requireAdminUser, async (req, res) => {
 // B. Notification ciblée pour un utilisateur spécifique (Messages chat, commandes)
 app.post('/push/notify-user', requireAuthenticatedUser, async (req, res) => {
   try {
-    const { targetUserId, title, body, url, tag, image } = req.body || {};
+    const { targetUserId, title, body, url, tag, image, chatPartnerId, listingId, orderId } = req.body || {};
     if (!targetUserId || !title || !body) {
       return res.status(400).json({ success: false, message: 'targetUserId, title et body requis' });
     }
@@ -1592,6 +1592,9 @@ app.post('/push/notify-user', requireAuthenticatedUser, async (req, res) => {
       tag: tag || 'user-notification',
       image: image || null,
       icon: '/web-app-manifest-192x192.png',
+      chatPartnerId: chatPartnerId || null,
+      listingId: listingId || null,
+      orderId: orderId || null,
     };
 
     const result = await sendPushToUser(targetUserId, payload);
