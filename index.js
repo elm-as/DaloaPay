@@ -395,28 +395,30 @@ async function sendPushToUser(userId, payload) {
 
     console.log(`[Push] 🚀 Envoi de la notification pour l'utilisateur ${userId}...`);
     // Déduplication absolue anti-doublon :
-    // 1 seul token Expo par type d'app (le plus récent), 1 seul WebPush par endpoint
-    const seenExpoApps = new Set();
-    const seenEndpoints = new Set();
-    const uniqueSubs = [];
-
+    // 1. D'abord extraire les tokens Expo (au maximum 1 par app_type, le plus récent)
+    const expoSubsByApp = new Map();
     for (const sub of subs) {
       if (sub.expo_push_token) {
         const appKey = sub.app_type || 'market';
-        if (!seenExpoApps.has(appKey)) {
-          seenExpoApps.add(appKey);
-          uniqueSubs.push(sub);
+        if (!expoSubsByApp.has(appKey)) {
+          expoSubsByApp.set(appKey, sub);
         }
-      } else if (sub.endpoint) {
-        // Ne pas envoyer de WebPush mobile si l'utilisateur a déjà reçu le push via l'app native Expo
+      }
+    }
+
+    const hasExpo = expoSubsByApp.size > 0;
+    const uniqueSubs = Array.from(expoSubsByApp.values());
+
+    // 2. Ensuite ajouter les WebPush (en éliminant les navigateurs mobiles si l'app native est présente)
+    const seenEndpoints = new Set();
+    for (const sub of subs) {
+      if (sub.endpoint && !seenEndpoints.has(sub.endpoint)) {
+        seenEndpoints.add(sub.endpoint);
         const isMobileWeb = sub.user_agent && (sub.user_agent.includes('Android') || sub.user_agent.includes('Mobile'));
-        if (isMobileWeb && seenExpoApps.size > 0) {
+        if (hasExpo && isMobileWeb) {
           continue;
         }
-        if (!seenEndpoints.has(sub.endpoint)) {
-          seenEndpoints.add(sub.endpoint);
-          uniqueSubs.push(sub);
-        }
+        uniqueSubs.push(sub);
       }
     }
 
@@ -445,23 +447,31 @@ async function broadcastPush(payload) {
       return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
-    // Déduplication par utilisateur et par canal pour éviter qu'un utilisateur reçoive plusieurs fois
-    const seenUserApp = new Set();
-    const seenEndpoints = new Set();
-    const uniqueSubs = [];
-
+    // 1. Extraire les tokens Expo uniques par (user_id, app_type)
+    const usersWithExpo = new Set();
+    const expoSubsByUserApp = new Map();
     for (const sub of subs) {
       if (sub.expo_push_token) {
         const key = `${sub.user_id}_${sub.app_type || 'market'}`;
-        if (!seenUserApp.has(key)) {
-          seenUserApp.add(key);
-          uniqueSubs.push(sub);
+        if (!expoSubsByUserApp.has(key)) {
+          expoSubsByUserApp.set(key, sub);
+          usersWithExpo.add(sub.user_id);
         }
-      } else if (sub.endpoint) {
-        if (!seenEndpoints.has(sub.endpoint)) {
-          seenEndpoints.add(sub.endpoint);
-          uniqueSubs.push(sub);
+      }
+    }
+
+    const uniqueSubs = Array.from(expoSubsByUserApp.values());
+
+    // 2. Extraire les endpoints Web (ignorer mobile web si l'utilisateur a l'app native)
+    const seenEndpoints = new Set();
+    for (const sub of subs) {
+      if (sub.endpoint && !seenEndpoints.has(sub.endpoint)) {
+        seenEndpoints.add(sub.endpoint);
+        const isMobileWeb = sub.user_agent && (sub.user_agent.includes('Android') || sub.user_agent.includes('Mobile'));
+        if (usersWithExpo.has(sub.user_id) && isMobileWeb) {
+          continue;
         }
+        uniqueSubs.push(sub);
       }
     }
 
