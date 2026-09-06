@@ -2005,6 +2005,7 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
         namespace: 'android_app',
         package_name: 'com.daloamarket.app',
         sha256_cert_fingerprints: [
+          'FD:F6:D6:35:F0:07:A7:23:CA:B3:B7:99:06:89:B5:D4:BD:EC:27:A4:D6:91:09:EE:0F:E3:47:4A:C4:9F:99:6E',
           '14:6D:E9:7D:0F:52:AB:E0:43:2D:A5:72:42:C6:8B:6C:54:3B:5A:61:94:E1:67:B2:7D:63:F6:4F:9C:20:C6:F0'
         ]
       }
@@ -2015,6 +2016,7 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
         namespace: 'android_app',
         package_name: 'com.daloamarket.delivery',
         sha256_cert_fingerprints: [
+          'D6:2E:BD:1F:D6:80:8C:DC:7B:7E:29:CF:82:67:D5:9B:B2:A5:CF:A4:05:8E:BD:D8:68:D8:FD:EF:C3:AF:3C:81',
           '14:6D:E9:7D:0F:52:AB:E0:43:2D:A5:72:42:C6:8B:6C:54:3B:5A:61:94:E1:67:B2:7D:63:F6:4F:9C:20:C6:F0'
         ]
       }
