@@ -320,6 +320,7 @@ async function sendExpoPush(expoPushToken, payload) {
       to: expoPushToken,
       sound: 'default',
       title: payload.title,
+      subtitle: payload.subtitle || undefined,
       body: payload.body,
       data: {
         url: payload.url || '/',
@@ -329,7 +330,7 @@ async function sendExpoPush(expoPushToken, payload) {
         listingId,
       },
       priority: 'high',
-      channelId: 'default',
+      channelId: payload.channelId || 'default',
     };
 
     const res = await fetch('https://exp.host/--/api/v2/push/send', {
@@ -683,9 +684,11 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
       const count = group.length;
       sendPushToUser(sellerId, {
         title: '🎉 Nouvelle commande reçue !',
-        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} pour ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA.`,
+        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} • ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA. Préparez le colis ! 📦`,
+        channelId: 'orders',
         url: `/mes-commandes`,
         tag: `order-${order.id}`,
+        orderId: order.id,
       }).catch(e => console.error('[Push Order Error]:', e));
     }
   }
@@ -1729,12 +1732,50 @@ app.post('/push/webhook', requireWebhookSecret(PUSH_WEBHOOK_SECRET, 'x-push-webh
       if (!targetUserId) return res.json({ ok: true, skipped: 'no receiver_id' });
 
       const content = record.content || '';
+
+      // Enrichissement : prénom expéditeur + titre de l'annonce
+      let senderName = null;
+      let listingTitle = null;
+      try {
+        const supabaseCtx = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+        const [senderRes, listingRes] = await Promise.all([
+          record.sender_id
+            ? supabaseCtx.from('users').select('full_name').eq('id', record.sender_id).maybeSingle()
+            : Promise.resolve({ data: null }),
+          record.listing_id
+            ? supabaseCtx.from('listings').select('title').eq('id', record.listing_id).maybeSingle()
+            : Promise.resolve({ data: null }),
+        ]);
+        if (senderRes.data?.full_name) {
+          senderName = senderRes.data.full_name.split(' ')[0];
+        }
+        if (listingRes.data?.title) {
+          listingTitle = listingRes.data.title;
+        }
+      } catch (_) { /* non-bloquant */ }
+
+      const shortListing = listingTitle
+        ? (listingTitle.length > 28 ? listingTitle.slice(0, 28) + '…' : listingTitle)
+        : null;
+
+      const notifTitle = senderName
+        ? (shortListing ? `💬 ${senderName} • ${shortListing}` : `💬 Message de ${senderName}`)
+        : '💬 Nouveau message';
+
+      const notifBody = content.length > 100
+        ? content.slice(0, 100) + '…'
+        : (content || 'Vous avez reçu un nouveau message.');
+
       const payload = {
-        title: '💬 Nouveau message DaloaMarket',
-        body: content.length > 80 ? content.slice(0, 80) + '...' : (content || 'Vous avez reçu un nouveau message.'),
+        title: notifTitle,
+        body: notifBody,
+        channelId: 'chat',
         url: `/messages/${record.listing_id || 'inbox'}/${record.sender_id}`,
         tag: `chat-${record.sender_id}`,
-        icon: '/web-app-manifest-192x192.png',
+        chatPartnerId: record.sender_id,
+        listingId: record.listing_id || null,
       };
 
       const result = await sendPushToUser(targetUserId, payload);
@@ -1749,34 +1790,52 @@ app.post('/push/webhook', requireWebhookSecret(PUSH_WEBHOOK_SECRET, 'x-push-webh
 
       // Notifier l'acheteur
       if (record.buyer_id) {
+        let buyerTitle = '📦 Commande mise à jour';
         let buyerMsg = 'Votre commande a été mise à jour.';
-        if (status === 'paid') buyerMsg = 'Paiement confirmé ! Votre commande est en préparation.';
-        else if (status === 'picked_up') buyerMsg = 'Le livreur a récupéré votre colis et fait route vers vous. 🚚';
-        else if (status === 'delivered') buyerMsg = 'Colis livré avec succès ! Merci de votre confiance. ✅';
-        else if (status === 'disputed') buyerMsg = 'Litige ouvert sur votre commande. Notre support intervient.';
+        if (status === 'paid') {
+          buyerTitle = '✅ Paiement confirmé !';
+          buyerMsg = 'Votre commande est en cours de préparation. Vous serez notifié dès la prise en charge.';
+        } else if (status === 'picked_up') {
+          buyerTitle = '🛵 Livreur en route !';
+          buyerMsg = 'Votre colis a été récupéré. Le livreur fait route vers vous.';
+        } else if (status === 'delivered') {
+          buyerTitle = '🎉 Colis livré !';
+          buyerMsg = 'Livraison effectuée avec succès. Merci pour votre confiance ❤️';
+        } else if (status === 'disputed') {
+          buyerTitle = '⚠️ Litige ouvert';
+          buyerMsg = 'Un litige a été ouvert sur votre commande. Notre équipe intervient.';
+        }
 
         await sendPushToUser(record.buyer_id, {
-          title: '📦 Mise à jour de commande',
+          title: buyerTitle,
           body: buyerMsg,
+          channelId: 'orders',
           url: `/suivi/${record.id}`,
           tag: `order-${record.id}`,
-          icon: '/web-app-manifest-192x192.png',
+          orderId: record.id,
         });
       }
 
       // Notifier le vendeur
       if (record.seller_id) {
+        let sellerTitle = null;
         let sellerMsg = null;
-        if (status === 'paid') sellerMsg = 'Nouvelle vente confirmée ! Préparez le colis pour le livreur. 🛍️';
-        else if (status === 'delivered') sellerMsg = 'Livraison validée ! Vos gains seront disponibles sous 24h. ✅';
+        if (status === 'paid') {
+          sellerTitle = '🎉 Nouvelle vente !';
+          sellerMsg = 'Paiement reçu ! Préparez le colis pour le livreur. 📦';
+        } else if (status === 'delivered') {
+          sellerTitle = '✅ Livraison validée';
+          sellerMsg = 'Votre colis a été remis. Vos gains seront disponibles sous 24h.';
+        }
 
         if (sellerMsg) {
           await sendPushToUser(record.seller_id, {
-            title: '🛍️ Notification Vendeur',
+            title: sellerTitle,
             body: sellerMsg,
+            channelId: 'orders',
             url: '/mes-commandes',
             tag: `order-seller-${record.id}`,
-            icon: '/web-app-manifest-192x192.png',
+            orderId: record.id,
           });
         }
       }
