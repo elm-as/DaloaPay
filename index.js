@@ -2008,6 +2008,16 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
           '14:6D:E9:7D:0F:52:AB:E0:43:2D:A5:72:42:C6:8B:6C:54:3B:5A:61:94:E1:67:B2:7D:63:F6:4F:9C:20:C6:F0'
         ]
       }
+    },
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.daloamarket.delivery',
+        sha256_cert_fingerprints: [
+          '14:6D:E9:7D:0F:52:AB:E0:43:2D:A5:72:42:C6:8B:6C:54:3B:5A:61:94:E1:67:B2:7D:63:F6:4F:9C:20:C6:F0'
+        ]
+      }
     }
   ]);
 });
