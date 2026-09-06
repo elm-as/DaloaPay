@@ -1936,6 +1936,23 @@ ${listingUrl}
   }
 });
 
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json([
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.daloamarket.app',
+        sha256_cert_fingerprints: [
+          '14:6D:E9:7D:0F:52:AB:E0:43:2D:A5:72:42:C6:8B:6C:54:3B:5A:61:94:E1:67:B2:7D:63:F6:4F:9C:20:C6:F0'
+        ]
+      }
+    }
+  ]);
+});
+
 app.use((err, req, res, next) => {
   res.status(500).json({ success: false, message: err.message || 'Erreur interne du serveur' });
 });
