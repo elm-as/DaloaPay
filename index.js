@@ -144,7 +144,7 @@ app.use(async (req, res, next) => {
     } else if (path.startsWith('/categorie/')) {
       categorySlug = path.split('/')[2];
     } else {
-      const catRoutes = ['electronique', 'vehicules', 'mode', 'maison-deco', 'sports-loisirs', 'livres', 'alimentaire'];
+      const catRoutes = ['electronique', 'vehicules', 'mode', 'cosmetiques', 'maison-deco', 'sports-loisirs', 'livres', 'alimentaire'];
       const rawSlug = path.replace(/^\//, '').toLowerCase();
       if (catRoutes.includes(rawSlug)) {
         categorySlug = rawSlug;
