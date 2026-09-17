@@ -204,6 +204,24 @@ function requireAdminSecret(req, res, next) {
   next();
 }
 
+/**
+ * Accepte soit le secret machine (`x-admin-secret`), soit un utilisateur
+ * authentifié.
+ *
+ * `/process-payouts` n'exigeait qu'un JWT utilisateur, si bien qu'il ne pouvait
+ * être déclenché que depuis un navigateur connecté : aucun planificateur ne
+ * pouvait l'appeler, et tout virement restait indéfiniment en `pending` tant que
+ * personne ne cliquait. Un moniteur d'uptime se prend un 401 pour la même raison.
+ * Le secret ouvre la voie serveur-à-serveur (pg_cron) sans rien changer au
+ * chemin navigateur existant.
+ */
+function allowSecretOrAuthenticatedUser(req, res, next) {
+  if (ADMIN_SECRET && secretMatches(req.get('x-admin-secret'), ADMIN_SECRET)) {
+    return next();
+  }
+  return requireAuthenticatedUser(req, res, next);
+}
+
 async function requireAuthenticatedUser(req, res, next) {
   const authorization = req.get('authorization') || '';
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
@@ -1342,7 +1360,7 @@ const processingPayouts = new Set();
 // La garantie de fond est ailleurs : les lignes de `payouts` ne peuvent plus
 // être forgées (create_seller_payout / create_delivery_payout révoquées pour
 // anon et authenticated, et montants relus depuis l'escrow).
-app.get('/process-payouts', requireAuthenticatedUser, payoutLimiter, async (req, res) => {
+app.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
