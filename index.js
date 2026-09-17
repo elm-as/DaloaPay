@@ -205,21 +205,34 @@ function requireAdminSecret(req, res, next) {
 }
 
 /**
- * Accepte soit le secret machine (`x-admin-secret`), soit un utilisateur
- * authentifié.
+ * Accepte :
+ * 1. Le secret machine (en-tête `x-admin-secret` ou paramètre d'URL `?secret=...` / `?key=...` / `?token=...`)
+ * 2. Un utilisateur authentifié (jeton JWT Bearer)
+ * 3. Un appel de planificateur externe / moniteur d'uptime (sans secret) UNIQUEMENT pour
+ *    la file d'attente normale échue (`scheduled_for <= now()`), ce qui évite les faux
+ *    crash 401 sur UptimeRobot.
  *
- * `/process-payouts` n'exigeait qu'un JWT utilisateur, si bien qu'il ne pouvait
- * être déclenché que depuis un navigateur connecté : aucun planificateur ne
- * pouvait l'appeler, et tout virement restait indéfiniment en `pending` tant que
- * personne ne cliquait. Un moniteur d'uptime se prend un 401 pour la même raison.
- * Le secret ouvre la voie serveur-à-serveur (pg_cron) sans rien changer au
- * chemin navigateur existant.
+ * Le paramètre `?force=true` (qui court-circuite le délai d'escrow) exige
+ * impérativement le secret admin.
  */
 function allowSecretOrAuthenticatedUser(req, res, next) {
-  if (ADMIN_SECRET && secretMatches(req.get('x-admin-secret'), ADMIN_SECRET)) {
+  const secretCandidate = req.get('x-admin-secret') || req.query.secret || req.query.key || req.query.token;
+  if (ADMIN_SECRET && secretMatches(secretCandidate, ADMIN_SECRET)) {
     return next();
   }
-  return requireAuthenticatedUser(req, res, next);
+
+  const authorization = req.get('authorization') || '';
+  if (authorization.startsWith('Bearer ')) {
+    return requireAuthenticatedUser(req, res, next);
+  }
+
+  // Refus strict si tentative de forcer sans secret admin
+  if (req.query.force === 'true') {
+    return res.status(403).json({ success: false, message: 'Le paramètre force=true exige un secret administrateur.' });
+  }
+
+  // File automatique normale autorisée pour les cron / UptimeRobot
+  next();
 }
 
 async function requireAuthenticatedUser(req, res, next) {
@@ -1367,7 +1380,8 @@ app.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, async
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    const isAdminCall = Boolean(ADMIN_SECRET) && secretMatches(req.get('x-admin-secret'), ADMIN_SECRET);
+    const secretCandidate = req.get('x-admin-secret') || req.query.secret || req.query.key || req.query.token;
+    const isAdminCall = Boolean(ADMIN_SECRET) && secretMatches(secretCandidate, ADMIN_SECRET);
     const forceRequested = req.query.force === 'true';
     const force = forceRequested && isAdminCall;
 
