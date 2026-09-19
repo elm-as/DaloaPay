@@ -85,7 +85,7 @@ async function renderDriverProfile(supabase, driverId) {
   const avatar = driver.avatar_url || 'https://daloa-delivery.shop/og-image.png';
 
   const bodyContent = `
-    <h1>${name} — Livreur ${vehicle} à Daloa</h1>
+    <h1>${name} : Livreur ${vehicle} à Daloa</h1>
     <p><strong>Note :</strong> ⭐ ${rating} / 5 (${driver.total_reviews || 0} avis)</p>
     <p><strong>Véhicule :</strong> ${vehicle}</p>
     <p><strong>Zones couvertes :</strong> ${escapeHtml((driver.coverage_zones || []).join(', ') || 'Daloa')}</p>

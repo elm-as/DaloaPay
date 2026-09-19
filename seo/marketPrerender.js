@@ -103,7 +103,7 @@ async function renderCategoryPage(supabase, slug) {
   let listHtml = `<h1>Annonces ${safeLabel} à Daloa</h1><p>${escapeHtml(config.desc)}</p><ul>`;
   items.forEach(item => {
     const photo = item.photos?.[0] ? `<img src="${escapeHtml(item.photos[0])}" alt="${escapeHtml(item.title)}" width="150" />` : '';
-    listHtml += `<li><h3>${escapeHtml(item.title)}</h3><p>Prix: ${item.price} FCFA — ${escapeHtml(item.district || 'Daloa')}</p>${photo}</li>`;
+    listHtml += `<li><h3>${escapeHtml(item.title)}</h3><p>Prix: ${item.price} FCFA, ${escapeHtml(item.district || 'Daloa')}</p>${photo}</li>`;
   });
   listHtml += '</ul>';
 
