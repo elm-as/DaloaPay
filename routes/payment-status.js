@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const { checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { checkPaymentLimiter } = require('../config/rate-limiters');
-const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { checkPaymentNotification } = require('../services/moneyfusion');
 const { createOrderFromEscrow } = require('../services/escrow');
 
@@ -15,8 +14,8 @@ const STATUS_MAP = {
   confirmed: 'paid',
 };
 
-// Vérifier le statut d'un paiement (appelé par PaymentReturnPage)
-router.get('/check-payment', requireAuthenticatedUser, checkPaymentLimiter, async (req, res) => {
+// Vérifier le statut d'un paiement (appelé par PaymentReturnPage et le polling app mobile)
+router.get('/check-payment', checkPaymentLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = getSupabaseAdminClient();

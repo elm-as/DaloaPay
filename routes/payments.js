@@ -168,8 +168,8 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
           seller_amount: productAmount - sellerCommission,
           delivery_address: oi.delivery_address || 'Daloa',
           delivery_mode: oi.delivery_mode || 'delivery',
-          delivery_lat: deliveryLat,
-          delivery_lng: deliveryLng,
+          delivery_lat: validDeliveryLat,
+          delivery_lng: validDeliveryLng,
           distance_km: Math.round(distanceKm * 10) / 10,
         });
       }
@@ -217,7 +217,9 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     }
 
     const baseUrl = ENV.SITE_URL.replace(/\/$/, '');
-    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}`;
+    const isApp = req.body.source === 'app' || req.body.platform === 'app';
+    const sourceParam = isApp ? '&source=app' : '';
+    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${sourceParam}`;
     const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
 
     let resolvedName = (customerName || '').trim();
