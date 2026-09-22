@@ -58,7 +58,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
         .from('payouts')
         .update({
           status: 'processing',
-          updated_at: new Date().toISOString(),
         })
         .eq('id', payout.id)
         .eq('status', 'pending')
@@ -92,7 +91,7 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
         if (result.statut === true) {
           const { error: updateErr } = await supabase
             .from('payouts')
-            .update({ provider_token: result.tokenPay, updated_at: new Date().toISOString() })
+            .update({ provider_token: result.tokenPay })
             .eq('id', payout.id);
           if (updateErr) console.error('[Payout DB Warning] Échec mise à jour provider_token:', updateErr);
           results.push({ id: payout.id, status: 'processing', token: result.tokenPay });
@@ -102,7 +101,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
             .update({
               status: 'failed',
               failure_reason: result.message || 'Erreur API MoneyFusion',
-              updated_at: new Date().toISOString(),
             })
             .eq('id', payout.id);
           if (updateErr) console.error('[Payout DB Error] Échec mise à jour status failed:', updateErr);
@@ -114,7 +112,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
           .update({
             status: 'failed',
             failure_reason: err.message || 'Exception réseau',
-            updated_at: new Date().toISOString(),
           })
           .eq('id', payout.id);
         if (updateErr) console.error('[Payout DB Error] Échec mise à jour exception réseau:', updateErr);
