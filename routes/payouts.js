@@ -13,9 +13,31 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
     if (!supabase) return res.status(503).json({ success: false, message: 'DB indisponible' });
 
     const secretCandidate = req.get('x-admin-secret') || req.query.secret || req.query.key || req.query.token;
-    const isAdminCall = Boolean(ENV.ADMIN_SECRET) && secretMatches(secretCandidate, ENV.ADMIN_SECRET);
+    let isAdminCall = Boolean(ENV.ADMIN_SECRET) && secretMatches(secretCandidate, ENV.ADMIN_SECRET);
+
+    // Si pas de secret machine, vérifier si l'utilisateur connecté via JWT est admin/superadmin
+    if (!isAdminCall && req.user?.id) {
+      const { data: adminUser } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      const role = String(adminUser?.role || '').toLowerCase();
+      if (['admin', 'superadmin', 'moderator', 'moderateur'].includes(role)) {
+        isAdminCall = true;
+      }
+    }
+
     const forceRequested = req.query.force === 'true';
     const force = forceRequested && isAdminCall;
+
+    // Si l'admin demande également de réinjecter les échecs dans la file d'attente
+    if (isAdminCall && req.query.retry_failed === 'true') {
+      await supabase
+        .from('payouts')
+        .update({ status: 'pending', failure_reason: null })
+        .eq('status', 'failed');
+    }
 
     let query = supabase
       .from('payouts')
@@ -120,6 +142,57 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
     }
 
     return res.json({ success: true, processed: payouts.length, results });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// 3.bis) Réessayer un payout individuel échoué (admin ou secret machine)
+router.post('/retry-payout/:id', allowSecretOrAuthenticatedUser, payoutLimiter, async (req, res) => {
+  try {
+    checkConfig();
+    const supabase = getSupabaseAdminClient();
+    if (!supabase) return res.status(503).json({ success: false, message: 'DB indisponible' });
+
+    const secretCandidate = req.get('x-admin-secret') || req.query.secret || req.query.key || req.query.token;
+    let isAdminCall = Boolean(ENV.ADMIN_SECRET) && secretMatches(secretCandidate, ENV.ADMIN_SECRET);
+
+    if (!isAdminCall && req.user?.id) {
+      const { data: adminUser } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      const role = String(adminUser?.role || '').toLowerCase();
+      if (['admin', 'superadmin', 'moderator', 'moderateur'].includes(role)) {
+        isAdminCall = true;
+      }
+    }
+
+    if (!isAdminCall) {
+      return res.status(403).json({ success: false, message: "Action réservée aux administrateurs." });
+    }
+
+    const payoutId = req.params.id;
+    const { data: payout, error: fetchErr } = await supabase
+      .from('payouts')
+      .select('*')
+      .eq('id', payoutId)
+      .maybeSingle();
+
+    if (fetchErr || !payout) {
+      return res.status(404).json({ success: false, message: 'Versement introuvable' });
+    }
+
+    // Remettre le statut à pending et effacer la raison d'échec
+    const { error: resetErr } = await supabase
+      .from('payouts')
+      .update({ status: 'pending', failure_reason: null })
+      .eq('id', payoutId);
+
+    if (resetErr) throw resetErr;
+
+    return res.json({ success: true, message: 'Versement réinitialisé en attente avec succès.' });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
   }
