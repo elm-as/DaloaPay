@@ -5,7 +5,7 @@ const PRICING = {
   DELIVERY_MIN: 500,
   DELIVERY_RATE_PER_KM: 85,
   DELIVERY_FREE_KM: 1.5,
-  BUYER_FEE_RATE: 0.0, // Annulé côté acheteur pour supprimer les frais
+  BUYER_FEE_RATE: 0.02, // 2% aligné sur @daloa/config
   SELLER_FEE_RATE: 0.035,
   PRO_SELLER_FEE_RATE: 0.025,
   DRIVER_FEE_RATE: 0.10,
@@ -128,6 +128,40 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
     const { error: itemsErr } = await supabase.from('order_items').insert(itemsPayload);
     if (itemsErr) {
       console.error('order_items creation error:', itemsErr.message);
+    }
+
+    // Décrémenter le stock de chaque article et marquer comme vendu si stock = 0
+    for (const it of group) {
+      try {
+        const { data: curListing } = await supabase
+          .from('listings')
+          .select('id, stock, status, variants')
+          .eq('id', it.listing_id)
+          .maybeSingle();
+
+        if (curListing) {
+          const prevStock = Number(curListing.stock) || 1;
+          const newStock = Math.max(0, prevStock - it.quantity);
+          const updatePayload = {
+            stock: newStock,
+            status: newStock === 0 ? 'sold' : curListing.status,
+          };
+
+          if (Array.isArray(curListing.variants) && it.variant_id) {
+            updatePayload.variants = curListing.variants.map((v) => {
+              if (v.id === it.variant_id) {
+                const vStock = Math.max(0, (Number(v.stock) || 0) - it.quantity);
+                return { ...v, stock: vStock, active: vStock > 0 };
+              }
+              return v;
+            });
+          }
+
+          await supabase.from('listings').update(updatePayload).eq('id', it.listing_id);
+        }
+      } catch (stockErr) {
+        console.error('[escrow] Erreur décrémentation stock:', stockErr);
+      }
     }
 
     const pickupOTP = generateOTP();

@@ -108,20 +108,43 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
 
         const { data: sellerProfile } = await supabase
           .from('users')
-          .select('pro_until, shop_latitude, shop_longitude')
+          .select('pro_until, shop_latitude, shop_longitude, district')
           .eq('id', listing.user_id)
           .single();
         const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
         const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
 
-        const deliveryLat = oi.delivery_lat || null;
-        const deliveryLng = oi.delivery_lng || null;
-        const sellerLat = sellerProfile?.shop_latitude || null;
-        const sellerLng = sellerProfile?.shop_longitude || null;
-        let distanceKm = 0;
-        if (deliveryLat != null && deliveryLng != null && sellerLat != null && sellerLng != null) {
-          distanceKm = haversineDistance(deliveryLat, deliveryLng, sellerLat, sellerLng);
+        const DALOA_CENTER_LAT = 6.8773;
+        const DALOA_CENTER_LNG = -6.4502;
+
+        let validSellerLat = sellerProfile?.shop_latitude ?? null;
+        let validSellerLng = sellerProfile?.shop_longitude ?? null;
+        if (validSellerLat != null && validSellerLng != null) {
+          if (haversineDistance(validSellerLat, validSellerLng, DALOA_CENTER_LAT, DALOA_CENTER_LNG) > 25) {
+            validSellerLat = DALOA_CENTER_LAT;
+            validSellerLng = DALOA_CENTER_LNG;
+          }
+        } else {
+          validSellerLat = DALOA_CENTER_LAT;
+          validSellerLng = DALOA_CENTER_LNG;
         }
+
+        let validDeliveryLat = oi.delivery_lat ?? null;
+        let validDeliveryLng = oi.delivery_lng ?? null;
+        if (validDeliveryLat != null && validDeliveryLng != null) {
+          if (haversineDistance(validDeliveryLat, validDeliveryLng, DALOA_CENTER_LAT, DALOA_CENTER_LNG) > 25) {
+            validDeliveryLat = DALOA_CENTER_LAT;
+            validDeliveryLng = DALOA_CENTER_LNG;
+          }
+        } else {
+          validDeliveryLat = DALOA_CENTER_LAT;
+          validDeliveryLng = DALOA_CENTER_LNG;
+        }
+
+        let distanceKm = haversineDistance(validDeliveryLat, validDeliveryLng, validSellerLat, validSellerLng);
+        // Borner à la distance intra-urbaine maximale de Daloa (15 km)
+        distanceKm = Math.min(15.0, Math.max(0.5, Math.round(distanceKm * 10) / 10));
+
         const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
         const alreadyCharged = sellersCharged.has(listing.user_id);
         const deliveryFee = (isPickupMode || alreadyCharged) ? 0 : calculateDeliveryFee(distanceKm);

@@ -39,19 +39,24 @@ router.post('/payment-webhook', async (req, res) => {
     const fusionStatus = fusionData.data.statut;
 
     // Contrôle du montant réellement encaissé (anti sous-paiement)
-    const paidAmountRaw = fusionData.data.Montant ?? fusionData.data.montant;
-    const paidAmount = Number(paidAmountRaw);
+    // MoneyFusion renvoie Montant (net) et frais (commission opérateur). Le client a payé Net + Frais.
+    const paidNetRaw = fusionData.data.Montant ?? fusionData.data.montant;
+    const paidFeesRaw = fusionData.data.frais ?? fusionData.data.Frais ?? 0;
+    const paidNet = Number(paidNetRaw) || 0;
+    const paidFees = Number(paidFeesRaw) || 0;
+    const paidGross = paidNet + paidFees;
     const expectedAmount = Number(tx.total_amount ?? tx.amount);
 
-    if (fusionStatus === 'paid' && Number.isFinite(paidAmount) && Number.isFinite(expectedAmount)
-        && paidAmount > 0 && paidAmount < expectedAmount) {
+    // Tolérance de 1 FCFA pour les arrondis de centimes
+    if (fusionStatus === 'paid' && Number.isFinite(paidGross) && Number.isFinite(expectedAmount)
+        && paidGross > 0 && paidGross < (expectedAmount - 1)) {
       console.warn(
-        `webhook: paiement insuffisant tx=${transactionId} encaisse=${paidAmount} attendu=${expectedAmount}`
+        `webhook: paiement insuffisant tx=${transactionId} brut=${paidGross} (net=${paidNet}, frais=${paidFees}) attendu=${expectedAmount}`
       );
       return res.json({
         ok: true,
         status: 'underpaid',
-        paid: paidAmount,
+        paid: paidGross,
         expected: expectedAmount,
       });
     }
