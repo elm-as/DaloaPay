@@ -141,6 +141,28 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
       }
     }
 
+    // Journalisation de l'action de forçage si effectuée par un administrateur
+    if (isAdminCall && (forceRequested || req.user?.id)) {
+      try {
+        const totalAmount = payouts.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        await supabase.from('admin_financial_audit_logs').insert({
+          admin_id: req.user?.id || '39ee0be2-ddb5-4124-b9f3-656a88b577bb', // Fallback ID si appel secret machine
+          action_type: 'payout_force_sync',
+          target_type: 'system',
+          target_id: 'payouts_cron_queue',
+          amount: totalAmount,
+          details: {
+            processed_count: payouts.length,
+            retry_failed: req.query.retry_failed === 'true',
+            forced: force,
+            results_summary: results.map((r) => ({ id: r.id, status: r.status, reason: r.reason })),
+          },
+        });
+      } catch (logErr) {
+        console.warn('[Audit Log Warning] Échec insertion log forçage sync payouts:', logErr);
+      }
+    }
+
     return res.json({ success: true, processed: payouts.length, results });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
@@ -191,6 +213,26 @@ router.post('/retry-payout/:id', allowSecretOrAuthenticatedUser, payoutLimiter, 
       .eq('id', payoutId);
 
     if (resetErr) throw resetErr;
+
+    // Journalisation de la réinitialisation dans la table d'audit financier
+    try {
+      await supabase.from('admin_financial_audit_logs').insert({
+        admin_id: req.user?.id || '39ee0be2-ddb5-4124-b9f3-656a88b577bb',
+        action_type: 'payout_retry',
+        target_type: 'payout',
+        target_id: payoutId,
+        amount: payout.amount,
+        recipient_phone: payout.recipient_phone,
+        details: {
+          previous_status: payout.status,
+          withdraw_mode: payout.withdraw_mode,
+          type: payout.type,
+          failure_reason: payout.failure_reason,
+        },
+      });
+    } catch (logErr) {
+      console.warn('[Audit Log Warning] Échec insertion log réessai payout:', logErr);
+    }
 
     return res.json({ success: true, message: 'Versement réinitialisé en attente avec succès.' });
   } catch (e) {
