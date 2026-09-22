@@ -139,6 +139,10 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
       return res.json({ success: true, type: 'expo' });
     }
 
+    // `app_type` et `is_active` étaient omis ici : un abonnement web était donc
+    // rangé par défaut avec les acheteurs ('market'). Un livreur qui s'abonnait
+    // depuis le tableau de bord web restait invisible pour tout envoi ciblé
+    // 'delivery'.
     const { error } = await supabase.from('push_subscriptions').upsert(
       {
         user_id,
@@ -146,6 +150,9 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
         keys_p256dh,
         keys_auth,
         user_agent: user_agent || null,
+        app_type: app_type || 'market',
+        is_active: true,
+        updated_at: new Date().toISOString(),
       },
       { onConflict: 'user_id,endpoint' }
     );
@@ -231,7 +238,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         if (status === 'paid') {
           buyerTitle = '✅ Paiement confirmé !';
           buyerMsg = 'Votre commande est en cours de préparation. Vous serez notifié dès la prise en charge.';
-        } else if (status === 'picked_up') {
+        } else if (status === 'in_transit' || status === 'picked_up') {
+          // `orders.status` ne contient pas 'picked_up' : verify_pickup écrit
+          // 'in_transit'. Cette branche ne se déclenchait donc jamais.
           buyerTitle = '🛵 Livreur en route !';
           buyerMsg = 'Votre colis a été récupéré. Le livreur fait route vers vous.';
         } else if (status === 'delivered') {
@@ -296,8 +305,30 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
               tag: `delivery-assign-${record.id}`,
             });
           }
-        } else if (!record.is_private) {
-          const { data: drivers } = await supabase.from('delivery_persons').select('user_id').eq('is_available', true);
+        } else {
+          // Course privée (paiement espèces) : elle est réservée aux livreurs
+          // affiliés au vendeur. Elle ne notifiait personne du tout, alors
+          // qu'elle attend elle aussi un preneur.
+          let drivers = null;
+          if (record.is_private) {
+            if (record.seller_id) {
+              const { data: affiliated } = await supabase
+                .from('seller_delivery_affiliations')
+                .select('delivery_persons!inner(user_id, is_available)')
+                .eq('seller_id', record.seller_id)
+                .eq('status', 'active');
+              drivers = (affiliated || [])
+                .map((a) => a.delivery_persons)
+                .filter((dp) => dp && dp.is_available);
+            }
+          } else {
+            const { data: available } = await supabase
+              .from('delivery_persons')
+              .select('user_id')
+              .eq('is_available', true);
+            drivers = available;
+          }
+
           if (drivers && drivers.length > 0) {
             for (const driver of drivers) {
               if (driver.user_id) {
@@ -313,7 +344,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         }
       }
 
-      if (type === 'UPDATE' && status === 'picked_up' && oldStatus !== 'picked_up') {
+      // Idem : verify_pickup fait passer l'assignation en 'in_transit'.
+      const isTransit = (s) => s === 'in_transit' || s === 'picked_up';
+      if (type === 'UPDATE' && isTransit(status) && !isTransit(oldStatus)) {
         const { data: order } = await supabase.from('orders').select('buyer_id').eq('id', record.order_id).maybeSingle();
         if (order?.buyer_id) {
           await sendPushToUser(order.buyer_id, {
