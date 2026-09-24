@@ -1,38 +1,9 @@
 const crypto = require('crypto');
 const { sendPushToUser } = require('./push');
 
-const PRICING = {
-  DELIVERY_MIN: 500,
-  DELIVERY_RATE_PER_KM: 85,
-  DELIVERY_FREE_KM: 1.5,
-  BUYER_FEE_RATE: 0.02, // 2% aligné sur @daloa/config
-  SELLER_FEE_RATE: 0.035,
-  PRO_SELLER_FEE_RATE: 0.025,
-  DRIVER_FEE_RATE: 0.10,
-};
-
-function haversineDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Earth radius in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-function calculateDeliveryFee(distanceKm) {
-  const baseFee = PRICING.DELIVERY_MIN;
-  let extraFee = 0;
-  if (distanceKm > PRICING.DELIVERY_FREE_KM) {
-    extraFee = Math.round((distanceKm - PRICING.DELIVERY_FREE_KM) * PRICING.DELIVERY_RATE_PER_KM);
-  }
-  return baseFee + extraFee;
-}
+// Tarification : une seule implémentation, partagée avec `payments.js` et
+// vérifiée par le test de parité. Ce fichier en portait sa propre copie.
+const { PRICING, haversineDistance, calculateDeliveryFee } = require('./pricing');
 
 const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
