@@ -4,13 +4,20 @@ const { ENV, getSupabaseAdminClient } = require('../config/env');
 const { requireAuthenticatedUser, requireAdminUser, requireAdminSecret, requireWebhookSecret } = require('../middlewares/auth');
 const { broadcastPush, sendPushToUser } = require('../services/push');
 
+/** Première photo d'une annonce (URL publique), ou null. */
+function firstPhoto(photos) {
+  const first = Array.isArray(photos) ? photos[0] : null;
+  return typeof first === 'string' && first.startsWith('http') ? first : null;
+}
+
 // A. Broadcast vers tous les appareils abonnés (Admin / Annonces globales)
 router.post('/push/broadcast', requireAdminUser, async (req, res) => {
   try {
-    const { title, body, url, tag, image } = req.body || {};
+    const { title, body, url, tag, image, appType } = req.body || {};
     if (!title || !body) {
       return res.status(400).json({ success: false, message: 'Titre et corps requis' });
     }
+    const targetApp = appType === 'market' || appType === 'delivery' ? appType : undefined;
 
     const payload = {
       title,
@@ -30,7 +37,7 @@ router.post('/push/broadcast', requireAdminUser, async (req, res) => {
       console.warn('[Push Broadcast] Supabase insert warning:', dbErr.message);
     }
 
-    const result = await broadcastPush(payload);
+    const result = await broadcastPush(payload, { appType: targetApp });
     return res.json({ success: true, ...result });
   } catch (err) {
     console.error('[Push Broadcast Exception]:', err);
@@ -38,10 +45,14 @@ router.post('/push/broadcast', requireAdminUser, async (req, res) => {
   }
 });
 
-// B. Notification ciblée pour un utilisateur spécifique
-router.post('/push/notify-user', requireAuthenticatedUser, async (req, res) => {
+// B. Notification ciblée pour un utilisateur spécifique — administration uniquement.
+// Elle était ouverte à tout utilisateur connecté, avec titre, texte et lien
+// libres : n'importe qui pouvait envoyer une fausse notification à n'importe
+// quel compte. Les notifications de chat sont émises par la base (trigger
+// push_webhook_messages → /push/webhook), à partir du vrai message.
+router.post('/push/notify-user', requireAdminUser, async (req, res) => {
   try {
-    const { targetUserId, title, body, url, tag, image, chatPartnerId, listingId, orderId } = req.body || {};
+    const { targetUserId, title, body, url, tag, image, chatPartnerId, listingId, orderId, appType } = req.body || {};
     if (!targetUserId || !title || !body) {
       return res.status(400).json({ success: false, message: 'targetUserId, title et body requis' });
     }
@@ -58,7 +69,9 @@ router.post('/push/notify-user', requireAuthenticatedUser, async (req, res) => {
       orderId: orderId || null,
     };
 
-    const result = await sendPushToUser(targetUserId, payload);
+    const result = await sendPushToUser(targetUserId, payload, {
+      appType: appType === 'delivery' || appType === 'market' ? appType : undefined,
+    });
     return res.json({ success: true, ...result });
   } catch (err) {
     console.error('[Push Notify User Exception]:', err);
@@ -175,10 +188,8 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
 
 // E. Webhook Supabase Database Trigger
 router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-push-webhook-secret'), async (req, res) => {
-  if (!ENV.VAPID_PUBLIC_KEY || !ENV.VAPID_PRIVATE_KEY) {
-    return res.status(503).json({ ok: false, error: 'Push VAPID keys non configurées' });
-  }
-
+  // Pas de refus global sans clés VAPID : elles ne servent qu'au web push, les
+  // apps (Expo) doivent continuer à recevoir leurs notifications.
   const { type, table, record, old_record } = req.body || {};
   if (!record || !table) {
     return res.status(400).json({ ok: false, error: 'Payload webhook invalide' });
@@ -195,17 +206,22 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
 
       let senderName = null;
       let listingTitle = null;
+      let listingPhoto = null;
       try {
         const [senderRes, listingRes] = await Promise.all([
           record.sender_id
-            ? supabase.from('users').select('full_name').eq('id', record.sender_id).maybeSingle()
+            ? supabase.from('users').select('full_name, shop_name').eq('id', record.sender_id).maybeSingle()
             : Promise.resolve({ data: null }),
           record.listing_id
-            ? supabase.from('listings').select('title').eq('id', record.listing_id).maybeSingle()
+            ? supabase.from('listings').select('title, photos').eq('id', record.listing_id).maybeSingle()
             : Promise.resolve({ data: null }),
         ]);
-        if (senderRes.data?.full_name) senderName = senderRes.data.full_name.split(' ')[0];
+        // Un vendeur apparaît sous le nom de sa boutique, comme dans le chat.
+        const shopName = senderRes.data?.shop_name?.trim();
+        if (shopName) senderName = shopName;
+        else if (senderRes.data?.full_name) senderName = senderRes.data.full_name.split(' ')[0];
         if (listingRes.data?.title) listingTitle = listingRes.data.title;
+        listingPhoto = firstPhoto(listingRes.data?.photos);
       } catch (_) { /* non-bloquant */ }
 
       const shortListing = listingTitle ? (listingTitle.length > 28 ? listingTitle.slice(0, 28) + '…' : listingTitle) : null;
@@ -216,13 +232,15 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         title: notifTitle,
         body: notifBody,
         channelId: 'chat',
-        url: `/messages/${record.listing_id || 'inbox'}/${record.sender_id}`,
+        // Sans annonce : conversation support (le web ne connaît pas « inbox »).
+        url: `/messages/${record.listing_id || 'support'}/${record.sender_id}`,
         tag: `chat-${record.sender_id}`,
+        image: listingPhoto,
         chatPartnerId: record.sender_id,
         listingId: record.listing_id || null,
       };
 
-      const result = await sendPushToUser(targetUserId, payload);
+      const result = await sendPushToUser(targetUserId, payload, { appType: 'market' });
       return res.json({ ok: true, ...result });
     }
 
@@ -232,12 +250,26 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       const oldStatus = old_record?.status;
       if (status === oldStatus) return res.json({ ok: true, skipped: 'status inchangé' });
 
+      // Article concerné : son titre personnalise le texte, sa photo s'affiche
+      // en grand dans la notification web.
+      let itemTitle = null;
+      let itemPhoto = null;
+      if (record.listing_id) {
+        try {
+          const { data: listing } = await supabase
+            .from('listings').select('title, photos').eq('id', record.listing_id).maybeSingle();
+          itemTitle = listing?.title ? (listing.title.length > 40 ? listing.title.slice(0, 40) + '…' : listing.title) : null;
+          itemPhoto = firstPhoto(listing?.photos);
+        } catch (_) { /* non-bloquant */ }
+      }
+      const forItem = itemTitle ? ` « ${itemTitle} »` : '';
+
       if (record.buyer_id) {
         let buyerTitle = '📦 Commande mise à jour';
         let buyerMsg = 'Votre commande a été mise à jour.';
         if (status === 'paid') {
           buyerTitle = '✅ Paiement confirmé !';
-          buyerMsg = 'Votre commande est en cours de préparation. Vous serez notifié dès la prise en charge.';
+          buyerMsg = `Votre commande${forItem} est en préparation. Vous serez notifié dès la prise en charge.`;
         } else if (status === 'in_transit' || status === 'picked_up') {
           // `orders.status` ne contient pas 'picked_up' : verify_pickup écrit
           // 'in_transit'. Cette branche ne se déclenchait donc jamais.
@@ -245,7 +277,14 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
           buyerMsg = 'Votre colis a été récupéré. Le livreur fait route vers vous.';
         } else if (status === 'delivered') {
           buyerTitle = '🎉 Colis livré !';
-          buyerMsg = 'Livraison effectuée avec succès. Merci pour votre confiance ❤️';
+          buyerMsg = `Votre commande${forItem} a été remise. Merci pour votre confiance ❤️`;
+        } else if (status === 'cancelled') {
+          // S'affichait « Commande mise à jour » : l'acheteur ne savait pas
+          // que sa commande était annulée.
+          buyerTitle = '❌ Commande annulée';
+          buyerMsg = record.payment_method === 'online'
+            ? `Votre commande${forItem} a été annulée. Le remboursement Mobile Money est en cours.`
+            : `Votre commande${forItem} a été annulée.`;
         } else if (status === 'disputed') {
           buyerTitle = '⚠️ Litige ouvert';
           buyerMsg = 'Un litige a été ouvert sur votre commande. Notre équipe intervient.';
@@ -257,8 +296,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
           channelId: 'orders',
           url: `/suivi/${record.id}`,
           tag: `order-${record.id}`,
+          image: itemPhoto,
           orderId: record.id,
-        });
+        }, { appType: 'market' });
       }
 
       if (record.seller_id) {
@@ -266,10 +306,13 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         let sellerMsg = null;
         if (status === 'paid') {
           sellerTitle = '🎉 Nouvelle vente !';
-          sellerMsg = 'Paiement reçu ! Préparez le colis pour le livreur. 📦';
+          sellerMsg = `Paiement reçu pour${forItem || ' votre article'} : préparez le colis. 📦`;
         } else if (status === 'delivered') {
           sellerTitle = '✅ Livraison validée';
-          sellerMsg = 'Votre colis a été remis. Vos gains seront disponibles sous 24h.';
+          // En espèces, le vendeur a déjà encaissé : aucun virement à annoncer.
+          sellerMsg = record.payment_method === 'online'
+            ? 'Votre colis a été remis. Votre virement Mobile Money est programmé.'
+            : 'Votre colis a été remis. La commande est clôturée.';
         }
 
         if (sellerMsg) {
@@ -279,8 +322,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             channelId: 'orders',
             url: '/mes-commandes',
             tag: `order-seller-${record.id}`,
+            image: itemPhoto,
             orderId: record.id,
-          });
+          }, { appType: 'market' });
         }
       }
 
@@ -292,7 +336,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       const status = record.status;
       const oldStatus = old_record?.status;
       const priceText = record.delivery_price ? `${Number(record.delivery_price).toLocaleString('fr-FR')} FCFA` : 'Rémunérée';
-      const orderUrl = `/suivi/${record.order_id}`;
+      // Lien ouvert par le site livreur (/course/:id). L'app livreur, elle,
+      // route sur le `tag` (delivery-assign-<id> / delivery-open-<id>).
+      const courseUrl = `/course/${record.id}`;
 
       if (type === 'INSERT' || (type === 'UPDATE' && status === 'awaiting_pickup' && oldStatus !== 'awaiting_pickup')) {
         if (record.delivery_person_id) {
@@ -301,9 +347,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             await sendPushToUser(dp.user_id, {
               title: '🛵 Nouvelle course assignée !',
               body: `Une livraison vous a été confiée à Daloa (${priceText}). Ouvrez l'application pour démarrer.`,
-              url: orderUrl,
+              url: courseUrl,
               tag: `delivery-assign-${record.id}`,
-            });
+            }, { appType: 'delivery' });
           }
         } else {
           // Course privée (paiement espèces) : elle est réservée aux livreurs
@@ -335,48 +381,20 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
                 sendPushToUser(driver.user_id, {
                   title: '🛵 Nouvelle course disponible !',
                   body: `Livraison à Daloa • Gain : ${priceText}. Premier arrivé, premier servi ! ⚡`,
-                  url: orderUrl,
+                  url: courseUrl,
                   tag: `delivery-open-${record.id}`,
-                }).catch((err) => console.warn('[Push Delivery Error]:', err));
+                }, { appType: 'delivery' }).catch((err) => console.warn('[Push Delivery Error]:', err));
               }
             }
           }
         }
       }
 
-      // Idem : verify_pickup fait passer l'assignation en 'in_transit'.
-      const isTransit = (s) => s === 'in_transit' || s === 'picked_up';
-      if (type === 'UPDATE' && isTransit(status) && !isTransit(oldStatus)) {
-        const { data: order } = await supabase.from('orders').select('buyer_id').eq('id', record.order_id).maybeSingle();
-        if (order?.buyer_id) {
-          await sendPushToUser(order.buyer_id, {
-            title: '🚚 Votre livreur est en route !',
-            body: 'Le livreur a récupéré votre colis et fait route vers votre adresse.',
-            url: orderUrl,
-            tag: `order-transit-${record.order_id}`,
-          });
-        }
-      }
-
-      if (type === 'UPDATE' && status === 'delivered' && oldStatus !== 'delivered') {
-        const { data: order } = await supabase.from('orders').select('buyer_id, seller_id').eq('id', record.order_id).maybeSingle();
-        if (order?.buyer_id) {
-          await sendPushToUser(order.buyer_id, {
-            title: '📦 Colis arrivé !',
-            body: 'Votre livreur est là. Communiquez votre code OTP pour valider la livraison.',
-            url: orderUrl,
-            tag: `order-delivered-${record.order_id}`,
-          });
-        }
-        if (order?.seller_id) {
-          await sendPushToUser(order.seller_id, {
-            title: '✅ Livraison effectuée !',
-            body: 'Le colis a été remis à l\'acheteur avec succès.',
-            url: '/mes-commandes',
-            tag: `seller-delivered-${record.order_id}`,
-          });
-        }
-      }
+      // Prise en charge et livraison : l'acheteur et le vendeur sont déjà
+      // prévenus par le changement de `orders.status` (branche 2), que
+      // verify_pickup et verify_delivery font en même temps. Les notifier ici
+      // aussi leur envoyait chaque message en double — dont un « Colis
+      // arrivé, donnez votre code » envoyé APRÈS la saisie du code.
 
       return res.json({ ok: true });
     }

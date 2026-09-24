@@ -3,6 +3,7 @@ const router = express.Router();
 const { checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { checkPaymentNotification } = require('../services/moneyfusion');
 const { createOrderFromEscrow } = require('../services/escrow');
+const { isUnderpaid, paidGrossAmount, confirmMonetizationOnce } = require('../services/monetization');
 
 // 2) Webhook Money Fusion
 router.post('/payment-webhook', async (req, res) => {
@@ -38,27 +39,13 @@ router.post('/payment-webhook', async (req, res) => {
 
     const fusionStatus = fusionData.data.statut;
 
-    // Contrôle du montant réellement encaissé (anti sous-paiement)
-    // MoneyFusion renvoie Montant (net) et frais (commission opérateur). Le client a payé Net + Frais.
-    const paidNetRaw = fusionData.data.Montant ?? fusionData.data.montant;
-    const paidFeesRaw = fusionData.data.frais ?? fusionData.data.Frais ?? 0;
-    const paidNet = Number(paidNetRaw) || 0;
-    const paidFees = Number(paidFeesRaw) || 0;
-    const paidGross = paidNet + paidFees;
+    // Contrôle du montant réellement encaissé (anti sous-paiement). Le montant
+    // attendu est celui fixé par le serveur à la création du paiement.
     const expectedAmount = Number(tx.total_amount ?? tx.amount);
-
-    // Tolérance de 1 FCFA pour les arrondis de centimes
-    if (fusionStatus === 'paid' && Number.isFinite(paidGross) && Number.isFinite(expectedAmount)
-        && paidGross > 0 && paidGross < (expectedAmount - 1)) {
-      console.warn(
-        `webhook: paiement insuffisant tx=${transactionId} brut=${paidGross} (net=${paidNet}, frais=${paidFees}) attendu=${expectedAmount}`
-      );
-      return res.json({
-        ok: true,
-        status: 'underpaid',
-        paid: paidGross,
-        expected: expectedAmount,
-      });
+    if (fusionStatus === 'paid' && isUnderpaid(fusionData, expectedAmount)) {
+      const paid = paidGrossAmount(fusionData);
+      console.warn(`webhook: paiement insuffisant tx=${transactionId} brut=${paid} attendu=${expectedAmount}`);
+      return res.json({ ok: true, status: 'underpaid', paid, expected: expectedAmount });
     }
 
     if (fusionStatus === 'paid') {
@@ -66,14 +53,7 @@ router.post('/payment-webhook', async (req, res) => {
         console.log('webhook: payment confirmed, creating order...');
         await createOrderFromEscrow(supabase, tx, personal);
       } else {
-        const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
-        if (rpcByType[type]) {
-          await supabase.rpc(rpcByType[type], { p_transaction_id: transactionId });
-        } else if (type === 'listing_pack_10' || type === 'credits_pack_5' || type === 'credits_pack_12' || type === 'credits_pack_30') {
-          const qty = type === 'listing_pack_10' ? 10 : Number(type.split('_')[2]) || 5;
-          await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: qty });
-        }
-        await supabase.from('monetization_transactions').update({ status: 'confirmed', confirmed_at: new Date().toISOString() }).eq('id', transactionId);
+        await confirmMonetizationOnce(supabase, tx);
       }
       return res.json({ ok: true, status: 'paid' });
     }

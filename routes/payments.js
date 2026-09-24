@@ -4,6 +4,7 @@ const { ENV, checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { createPaymentLimiter } = require('../config/rate-limiters');
 const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { createPaymentSession } = require('../services/moneyfusion');
+const { resolveMonetizationPrice } = require('../services/monetization');
 const {
   PRICING,
   calculateDeliveryFee,
@@ -18,9 +19,18 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
   console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
-    const { type, amount, customerName, customerPhone, userId, metadata, orderInput, orderInputs } = req.body;
+    const { type, amount, plan, customerName, customerPhone, metadata, orderInput, orderInputs } = req.body;
 
-    const allowedTypes = ['seller_badge', 'listing_pack_10', 'order', 'credits_pack_5', 'credits_pack_12', 'credits_pack_30'];
+    // L'acheteur est celui de la session, jamais celui du corps de la requête :
+    // sinon on pouvait créer une commande ou activer un Pass Pro au nom d'autrui.
+    const userId = req.user.id;
+    if (req.body.userId && req.body.userId !== userId) {
+      return res.status(403).json({ success: false, message: 'Utilisateur non autorisé pour ce paiement.' });
+    }
+
+    // `listing_pack_10` (ancien pack de publication) n'est plus vendu : la
+    // publication n'est plus limitée, les crédits servent au boost.
+    const allowedTypes = ['seller_badge', 'order', 'credits_pack_5', 'credits_pack_12', 'credits_pack_30'];
     if (!type || !allowedTypes.includes(type)) {
       return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
     }
@@ -38,7 +48,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
 
     const payConfig = settingsMap['payment_settings'] || {};
     const phaseConfig = settingsMap['phase_config'] || {};
-    const isPhase0 = phaseConfig.phase === 0;
 
     if (payConfig.disable_online_payments || payConfig.status === 'down') {
       return res.status(503).json({
@@ -48,7 +57,8 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     }
 
     let transactionId = '';
-    let finalAmount = amount;
+    let finalAmount = 0;
+    let resolvedPlan = null;
 
     if (type === 'order') {
       const rawItems = Array.isArray(orderInputs) && orderInputs.length > 0
@@ -122,7 +132,15 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
           .eq('id', listing.user_id)
           .single();
         const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
-        const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
+        // Même règle que create_cod_order : commission imposée par l'admin
+        // (phase_config.seller_fee_override) si elle est définie, sinon taux
+        // standard. L'ancien calcul ignorait l'override et forçait 0 % en
+        // phase 0 : une même vente ne payait pas la même commission selon
+        // qu'elle était réglée en ligne ou à la livraison.
+        const feeOverride = phaseConfig.seller_fee_override;
+        const sellerFeeRate = feeOverride != null && Number.isFinite(Number(feeOverride))
+          ? Number(feeOverride)
+          : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
 
         // Règle unique : GPS si exploitable, sinon barycentre du quartier
         // déclaré, sinon centre de Daloa. Le repli par quartier manquait ici,
@@ -204,11 +222,16 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       transactionId = escrow.id;
 
     } else {
-      if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Montant invalide.' });
+      // Prix fixé par le serveur : le `amount` envoyé par l'appli est ignoré
+      // (il ne sert qu'à reconnaître la formule Pro des anciennes APK).
+      const price = resolveMonetizationPrice(type, plan, amount);
+      if (!price) return res.status(400).json({ success: false, message: 'Type de paiement invalide.' });
+      finalAmount = price.amount;
+      resolvedPlan = price.plan;
 
       const { data: tx, error: txErr } = await supabase
         .from('monetization_transactions')
-        .insert({ user_id: userId, type, amount: Math.round(amount), status: 'pending' })
+        .insert({ user_id: userId, type, amount: finalAmount, status: 'pending' })
         .select('id')
         .single();
 
@@ -243,18 +266,19 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     }
 
     const labelByType = {
-      seller_badge: 'Badge Vendeur Pro (30 jours)',
-      listing_pack_10: 'Pack 10 annonces (500 FCFA)',
+      seller_badge: resolvedPlan === 'yearly' ? 'Pass Vendeur Pro (1 an)' : 'Pass Vendeur Pro (30 jours)',
       order: 'Achat de produit sur DaloaMarket',
-      credits_pack_5: 'Pack Bronze (5 crédits)',
-      credits_pack_12: 'Pack Argent (12 crédits)',
-      credits_pack_30: 'Pack Or (30 crédits)',
+      credits_pack_5: 'Pack Bronze (5 crédits de boost)',
+      credits_pack_12: 'Pack Argent (12 crédits de boost)',
+      credits_pack_30: 'Pack Or (30 crédits de boost)',
     };
 
     const fusionPayload = {
       totalPrice: Math.round(finalAmount),
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
-      personal_Info: [{ userId, transactionId, type, ...(metadata || {}), ...(orderInput || {}) }],
+      // Les identifiants passent en dernier : le webhook les relit, l'appli ne
+      // doit pas pouvoir les écraser via `metadata` ou `orderInput`.
+      personal_Info: [{ ...(metadata || {}), ...(orderInput || {}), userId, transactionId, type }],
       numeroSend: cleanPhone,
       nomclient: resolvedName || 'Client DaloaMarket',
       return_url: returnUrl,

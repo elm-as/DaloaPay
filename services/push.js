@@ -1,7 +1,9 @@
 const webpush = require('web-push');
 const { ENV, getSupabaseAdminClient } = require('../config/env');
 
-if (ENV.VAPID_PUBLIC_KEY && ENV.VAPID_PRIVATE_KEY) {
+const VAPID_CONFIGURED = Boolean(ENV.VAPID_PUBLIC_KEY && ENV.VAPID_PRIVATE_KEY);
+
+if (VAPID_CONFIGURED) {
   try {
     webpush.setVapidDetails(ENV.VAPID_SUBJECT, ENV.VAPID_PUBLIC_KEY, ENV.VAPID_PRIVATE_KEY);
     console.log('[WebPush] VAPID configured successfully from env');
@@ -118,18 +120,27 @@ async function dispatchPush(sub, payload) {
   if (sub.expo_push_token) {
     return sendExpoPush(sub.expo_push_token, payload);
   } else if (sub.endpoint) {
+    // Sans clés VAPID, seul le web push est impossible : les apps (Expo) restent servies.
+    if (!VAPID_CONFIGURED) return { success: false, message: 'Clés VAPID absentes' };
     return sendWebPush(sub, payload);
   }
   return { success: false, message: 'Aucun token valide' };
 }
 
-async function sendPushToUser(userId, payload) {
+/**
+ * @param {object} [options]
+ * @param {'market'|'delivery'} [options.appType] Limite l'envoi aux abonnements
+ *   de cette application. Sans ce filtre, une notification de course partait
+ *   aussi dans l'app DaloaMarket d'un livreur (et inversement), avec un lien
+ *   que l'autre application ne sait pas ouvrir.
+ */
+async function sendPushToUser(userId, payload, options = {}) {
   if (!userId) return { success: false, message: 'Identifiant utilisateur requis' };
   try {
     const supabase = getSupabaseAdminClient();
     if (!supabase) return { success: false, message: 'DB indisponible' };
 
-    const { data: subs, error } = await supabase
+    const { data: allSubs, error } = await supabase
       .from('push_subscriptions')
       .select('*')
       .eq('user_id', userId)
@@ -140,6 +151,10 @@ async function sendPushToUser(userId, payload) {
       console.error(`[Push] Erreur DB pour user ${userId}:`, error.message);
       return { success: false, error: error.message };
     }
+
+    const subs = options.appType
+      ? (allSubs || []).filter((sub) => (sub.app_type || 'market') === options.appType)
+      : allSubs;
 
     if (!subs || subs.length === 0) {
       return { success: true, sent: 0, message: 'Aucun abonnement push trouvé pour cet utilisateur' };
@@ -179,16 +194,23 @@ async function sendPushToUser(userId, payload) {
   }
 }
 
-async function broadcastPush(payload) {
+/**
+ * @param {object} [options]
+ * @param {'market'|'delivery'} [options.appType] Limite la diffusion aux
+ *   abonnés d'une application. L'admin proposait un choix d'audience qui
+ *   n'était jamais transmis : tout partait à tout le monde.
+ */
+async function broadcastPush(payload, options = {}) {
   try {
     const supabase = getSupabaseAdminClient();
     if (!supabase) return { success: false, message: 'DB indisponible' };
 
-    const { data: subs, error } = await supabase
+    let query = supabase
       .from('push_subscriptions')
       .select('*')
-      .eq('is_active', true)
-      .order('updated_at', { ascending: false });
+      .eq('is_active', true);
+    if (options.appType) query = query.eq('app_type', options.appType);
+    const { data: subs, error } = await query.order('updated_at', { ascending: false });
 
     if (error || !subs || subs.length === 0) {
       return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };

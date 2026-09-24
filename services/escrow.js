@@ -9,13 +9,54 @@ const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
 /**
  * Crée l'order + delivery_assignment UNIQUEMENT quand le paiement est confirmé.
- * Idempotent : si l'escrow a déjà un order_id, on ne recrée pas.
- * @returns {Promise<string>} order_id
+ *
+ * Idempotent, y compris en cas d'appels simultanés : le webhook MoneyFusion et
+ * le polling `check-payment` arrivent souvent ensemble. Ils lisaient tous deux
+ * `order_id = null` et créaient chacun la commande (doublon + stock décrémenté
+ * deux fois). L'escrow est maintenant réservé par un UPDATE conditionnel
+ * `pending → funded` ; seul l'appel qui l'obtient crée la commande.
+ *
+ * @returns {Promise<string|null>} order_id, ou null si un autre appel est en
+ *   train de la créer.
  */
 async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   if (escrow.order_id) {
     return escrow.order_id;
   }
+
+  const { data: claimed, error: claimErr } = await supabase
+    .from('escrow_transactions')
+    .update({ status: 'funded', funded_at: new Date().toISOString() })
+    .eq('id', escrow.id)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
+
+  if (claimErr) throw claimErr;
+  if (!claimed) {
+    const { data: current } = await supabase
+      .from('escrow_transactions')
+      .select('order_id')
+      .eq('id', escrow.id)
+      .maybeSingle();
+    return current?.order_id || null;
+  }
+
+  try {
+    return await createOrdersForClaimedEscrow(supabase, escrow, personalInfo);
+  } catch (err) {
+    // Rien n'a été créé de façon exploitable : on rend l'escrow pour que la
+    // prochaine notification réessaie.
+    await supabase
+      .from('escrow_transactions')
+      .update({ status: 'pending', funded_at: null })
+      .eq('id', escrow.id)
+      .is('order_id', null);
+    throw err;
+  }
+}
+
+async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
 
   const meta = escrow.order_metadata || {};
 
@@ -38,6 +79,7 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
         : 0,
     delivery_fee: i.delivery_fee != null ? i.delivery_fee : isLegacySingle ? escrow.delivery_fee || 0 : 0,
     platform_fee: i.platform_fee != null ? i.platform_fee : isLegacySingle ? escrow.platform_fee || 0 : 0,
+    seller_amount: i.seller_amount != null ? i.seller_amount : isLegacySingle ? escrow.seller_amount : null,
   }));
 
   const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
@@ -56,6 +98,14 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
     const productAmount = group.reduce((s, i) => s + (i.product_amount || 0), 0);
     const deliveryFee = group.reduce((s, i) => s + (i.delivery_fee || 0), 0);
     const platformFee = group.reduce((s, i) => s + (i.platform_fee || 0), 0);
+    // `platform_fee` des articles = frais de service ACHETEUR. En base,
+    // `orders.platform_commission` porte la commission VENDEUR et `reserve_fee`
+    // les frais acheteur (create_cod_order, record_cod_receivable, rapports).
+    // Les commandes en ligne inversaient les deux.
+    const sellerCommission = group.reduce(
+      (s, i) => s + (i.seller_amount != null ? Math.max(0, (i.product_amount || 0) - i.seller_amount) : 0),
+      0
+    );
     const totalQuantity = group.reduce((s, i) => s + i.quantity, 0);
     const orderTotal = productAmount + deliveryFee + platformFee;
     const first = group[0];
@@ -72,7 +122,8 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
         quantity: totalQuantity,
         product_amount: productAmount,
         delivery_fee: deliveryFee,
-        platform_commission: platformFee,
+        platform_commission: sellerCommission,
+        reserve_fee: platformFee,
         total_amount: orderTotal,
         delivery_address: address,
         delivery_mode: deliveryMode,
@@ -85,7 +136,12 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
       console.error('Order creation error:', orderErr);
       throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
     }
-    if (!firstOrderId) firstOrderId = order.id;
+    if (!firstOrderId) {
+      firstOrderId = order.id;
+      // Inscrit tout de suite : si la suite échoue, l'escrow n'est plus remis
+      // en attente (voir createOrderFromEscrow) et rien n'est recréé.
+      await supabase.from('escrow_transactions').update({ order_id: order.id }).eq('id', escrow.id);
+    }
 
     const itemsPayload = group.map((i) => ({
       order_id: order.id,
@@ -168,7 +224,7 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
 
   await supabase
     .from('escrow_transactions')
-    .update({ order_id: firstOrderId, status: 'funded', funded_at: new Date().toISOString() })
+    .update({ order_id: firstOrderId })
     .eq('id', escrow.id);
 
   return firstOrderId;

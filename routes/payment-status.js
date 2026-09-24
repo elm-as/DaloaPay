@@ -4,6 +4,7 @@ const { checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { checkPaymentLimiter } = require('../config/rate-limiters');
 const { checkPaymentNotification } = require('../services/moneyfusion');
 const { createOrderFromEscrow } = require('../services/escrow');
+const { isUnderpaid, confirmMonetizationOnce } = require('../services/monetization');
 
 const STATUS_MAP = {
   pending: 'pending',
@@ -59,6 +60,11 @@ router.get('/check-payment', checkPaymentLimiter, async (req, res) => {
         try {
           const fusionData = await checkPaymentNotification(escrow.payment_reference);
           if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
+            // Même contrôle que le webhook : ce chemin créait la commande sans
+            // vérifier le montant encaissé.
+            if (isUnderpaid(fusionData, escrow.total_amount)) {
+              return res.json({ success: true, status: 'pending', transactionId: escrow.id, amount: escrow.total_amount });
+            }
             console.log('check-payment: payment confirmed, creating order...');
             const orderId = await createOrderFromEscrow(supabase, escrow, null);
             return res.json({
@@ -121,17 +127,10 @@ router.get('/check-payment', checkPaymentLimiter, async (req, res) => {
         try {
           const fusionData = await checkPaymentNotification(tx.provider_token);
           if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
-            const rpcByType = { seller_badge: 'confirm_seller_badge', boost: 'confirm_boost', bump: 'confirm_bump' };
-            if (rpcByType[tx.type]) {
-              await supabase.rpc(rpcByType[tx.type], { p_transaction_id: tx.id });
-            } else if (tx.type === 'listing_pack_10' || tx.type === 'credits_pack_5' || tx.type === 'credits_pack_12' || tx.type === 'credits_pack_30') {
-              const qty = tx.type === 'listing_pack_10' ? 10 : Number(tx.type.split('_')[2]) || 5;
-              await supabase.rpc('add_listing_credits', { user_uuid: tx.user_id, quantity: qty });
+            if (isUnderpaid(fusionData, tx.amount)) {
+              return res.json({ success: true, status: 'pending', transactionId: tx.id, amount: tx.amount });
             }
-            await supabase
-              .from('monetization_transactions')
-              .update({ status: 'confirmed', confirmed_at: new Date().toISOString() })
-              .eq('id', tx.id);
+            await confirmMonetizationOnce(supabase, tx);
 
             return res.json({
               success: true,
