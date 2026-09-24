@@ -4,7 +4,14 @@ const { ENV, checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { createPaymentLimiter } = require('../config/rate-limiters');
 const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { createPaymentSession } = require('../services/moneyfusion');
-const { PRICING, haversineDistance, calculateDeliveryFee } = require('../services/escrow');
+const {
+  PRICING,
+  calculateDeliveryFee,
+  resolvePoint,
+  resolveBillableDistanceKm,
+  parseDistrictFromAddress,
+  loadDistricts,
+} = require('../services/pricing');
 
 // 1) Créer un paiement (Order Escrow ou Monétisation)
 router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
@@ -55,6 +62,9 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       const metaItems = [];
       let grandTotal = 0;
       const sellersCharged = new Set();
+      // Barycentres de quartiers : repli quand un vendeur ou un acheteur n'a pas
+      // de GPS exploitable. Chargés une fois pour tout le panier.
+      const districts = await loadDistricts(supabase);
 
       for (const oi of rawItems) {
         let listing = null;
@@ -114,36 +124,26 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
         const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
         const sellerFeeRate = isPhase0 ? 0.0 : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
 
-        const DALOA_CENTER_LAT = 6.8773;
-        const DALOA_CENTER_LNG = -6.4502;
+        // Règle unique : GPS si exploitable, sinon barycentre du quartier
+        // déclaré, sinon centre de Daloa. Le repli par quartier manquait ici,
+        // toute boutique sans GPS était réputée au centre-ville.
+        const buyerDistrict = parseDistrictFromAddress(oi.delivery_address);
+        const sellerPoint = resolvePoint(
+          sellerProfile?.shop_latitude,
+          sellerProfile?.shop_longitude,
+          sellerProfile?.district,
+          districts
+        );
+        const buyerPoint = resolvePoint(oi.delivery_lat, oi.delivery_lng, buyerDistrict, districts);
 
-        let validSellerLat = sellerProfile?.shop_latitude ?? null;
-        let validSellerLng = sellerProfile?.shop_longitude ?? null;
-        if (validSellerLat != null && validSellerLng != null) {
-          if (haversineDistance(validSellerLat, validSellerLng, DALOA_CENTER_LAT, DALOA_CENTER_LNG) > 25) {
-            validSellerLat = DALOA_CENTER_LAT;
-            validSellerLng = DALOA_CENTER_LNG;
-          }
-        } else {
-          validSellerLat = DALOA_CENTER_LAT;
-          validSellerLng = DALOA_CENTER_LNG;
-        }
+        const validSellerLat = sellerPoint.lat;
+        const validSellerLng = sellerPoint.lng;
+        const validDeliveryLat = buyerPoint.lat;
+        const validDeliveryLng = buyerPoint.lng;
 
-        let validDeliveryLat = oi.delivery_lat ?? null;
-        let validDeliveryLng = oi.delivery_lng ?? null;
-        if (validDeliveryLat != null && validDeliveryLng != null) {
-          if (haversineDistance(validDeliveryLat, validDeliveryLng, DALOA_CENTER_LAT, DALOA_CENTER_LNG) > 25) {
-            validDeliveryLat = DALOA_CENTER_LAT;
-            validDeliveryLng = DALOA_CENTER_LNG;
-          }
-        } else {
-          validDeliveryLat = DALOA_CENTER_LAT;
-          validDeliveryLng = DALOA_CENTER_LNG;
-        }
-
-        let distanceKm = haversineDistance(validDeliveryLat, validDeliveryLng, validSellerLat, validSellerLng);
-        // Borner à la distance intra-urbaine maximale de Daloa (15 km)
-        distanceKm = Math.min(15.0, Math.max(0.5, Math.round(distanceKm * 10) / 10));
+        // Distance routière réelle (Mapbox, repli OSRM puis vol d'oiseau × 1,3),
+        // la même cascade que celle affichée au client avant paiement.
+        const distanceKm = await resolveBillableDistanceKm(sellerPoint, buyerPoint);
 
         const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
         const alreadyCharged = sellersCharged.has(listing.user_id);
