@@ -164,6 +164,15 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
         const distanceKm = await resolveBillableDistanceKm(sellerPoint, buyerPoint);
 
         const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
+        // Même règle que create_cod_order : hors phase 0, le retrait en boutique
+        // est réservé aux vendeurs Pro (sauf si l'admin le rouvre à tous).
+        if (isPickupMode && phaseConfig.allow_pickup_for_all === false && !isProSeller) {
+          return res.status(403).json({
+            success: false,
+            reason: 'pickup_not_allowed',
+            message: "Le retrait en boutique n'est pas disponible pour cet article.",
+          });
+        }
         const alreadyCharged = sellersCharged.has(listing.user_id);
         const deliveryFee = (isPickupMode || alreadyCharged) ? 0 : calculateDeliveryFee(distanceKm);
         if (!isPickupMode) sellersCharged.add(listing.user_id);
@@ -193,6 +202,20 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       }
 
       finalAmount = grandTotal;
+
+      // Le serveur fait foi, mais l'acheteur ne doit jamais découvrir un total
+      // plus élevé que celui qu'on lui a montré (ex. appli ancienne qui plaçait
+      // le vendeur au centre du quartier : 806 F affichés, 1 044 F facturés).
+      // Petite marge pour les écarts d'itinéraire entre appareil et serveur.
+      const displayedAmount = Number(amount) || 0;
+      if (displayedAmount > 0 && grandTotal > displayedAmount + 100) {
+        return res.status(409).json({
+          success: false,
+          reason: 'amount_mismatch',
+          serverAmount: grandTotal,
+          message: `Le prix de la livraison a été recalculé : le total est de ${grandTotal} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser, ou mettez l'application à jour.`,
+        });
+      }
 
       const { data: escrow, error: escrowErr } = await supabase
         .from('escrow_transactions')
