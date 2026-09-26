@@ -28,7 +28,7 @@ const DISTANCE_RULE = {
 };
 
 const DALOA_CENTER = { lat: 6.8773, lng: -6.4502 };
-const GEOFENCE_RADIUS_KM = 18;
+const GEOFENCE_RADIUS_KM = 10;
 
 const MAPBOX_TOKEN =
   process.env.MAPBOX_TOKEN ||

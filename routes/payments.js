@@ -6,13 +6,55 @@ const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { createPaymentSession } = require('../services/moneyfusion');
 const { resolveMonetizationPrice } = require('../services/monetization');
 const {
-  PRICING,
-  calculateDeliveryFee,
-  resolvePoint,
-  resolveBillableDistanceKm,
-  parseDistrictFromAddress,
-  loadDistricts,
-} = require('../services/pricing');
+  QuoteError,
+  buildOrderQuote,
+  saveQuote,
+  loadQuoteForPayment,
+  markQuoteUsed,
+} = require('../services/quote');
+
+// 0) Devis de commande : calculé une fois ici, affiché tel quel par le client,
+//    puis facturé tel quel (/create-payment avec quoteId, ou create_cod_order).
+router.post('/quote', requireAuthenticatedUser, async (req, res) => {
+  try {
+    checkConfig();
+    const supabase = getSupabaseAdminClient();
+    if (!supabase) return res.status(503).json({ success: false, message: 'DB indisponible' });
+
+    const { data: phaseRow } = await supabase
+      .from('system_settings')
+      .select('value')
+      .eq('key', 'phase_config')
+      .maybeSingle();
+    const phaseConfig = phaseRow?.value || {};
+
+    const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
+    const quote = await buildOrderQuote(supabase, { rawItems, phaseConfig });
+    const saved = await saveQuote(supabase, req.user.id, quote, rawItems[0]?.delivery_address);
+
+    return res.json({
+      success: true,
+      quote: {
+        id: saved.id,
+        expiresAt: saved.expires_at,
+        deliveryMode: saved.delivery_mode,
+        sellers: saved.sellers,
+        productTotal: saved.product_total,
+        deliveryTotal: saved.delivery_total,
+        buyerFeeTotal: saved.buyer_fee_total,
+        totalAmount: saved.total_amount,
+        // Distance affichée : la plus longue course du panier.
+        distanceKm: Math.max(0, ...saved.sellers.map((x) => Number(x.distance_km) || 0)),
+      },
+    });
+  } catch (err) {
+    if (err instanceof QuoteError) {
+      return res.status(err.status).json({ success: false, reason: err.reason, message: err.message });
+    }
+    console.error('POST /quote error:', err);
+    return res.status(500).json({ success: false, message: 'Devis indisponible, réessayez.' });
+  }
+});
 
 // 1) Créer un paiement (Order Escrow ou Monétisation)
 router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
@@ -61,160 +103,42 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     let resolvedPlan = null;
 
     if (type === 'order') {
-      const rawItems = Array.isArray(orderInputs) && orderInputs.length > 0
-        ? orderInputs
-        : (orderInput ? [orderInput] : []);
+      // Avec un devis (applications à jour) : on facture exactement ce qui a été
+      // affiché, après avoir vérifié que les articles se vendent au même prix.
+      // Sans devis (anciennes applications) : calcul ici, et refus si le total
+      // dépasse nettement celui que l'acheteur a vu.
+      let metaItems;
+      let quoteId = null;
+      try {
+        if (req.body.quoteId) {
+          const quote = await loadQuoteForPayment(supabase, req.body.quoteId, userId);
+          metaItems = quote.items;
+          finalAmount = quote.total_amount;
+          quoteId = quote.id;
+        } else {
+          const rawItems = Array.isArray(orderInputs) && orderInputs.length > 0
+            ? orderInputs
+            : (orderInput ? [orderInput] : []);
+          const computed = await buildOrderQuote(supabase, { rawItems, phaseConfig });
+          metaItems = computed.items;
+          finalAmount = computed.totals.total_amount;
 
-      if (rawItems.length === 0) {
-        return res.status(400).json({ success: false, message: 'Aucun article à commander.' });
-      }
-
-      const metaItems = [];
-      let grandTotal = 0;
-      const sellersCharged = new Set();
-      // Barycentres de quartiers : repli quand un vendeur ou un acheteur n'a pas
-      // de GPS exploitable. Chargés une fois pour tout le panier.
-      const districts = await loadDistricts(supabase);
-
-      for (const oi of rawItems) {
-        let listing = null;
-        const rawListingId = oi?.listing_id;
-        if (rawListingId) {
-          const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawListingId);
-          if (isUUID) {
-            const r = await supabase
-              .from('listings')
-              .select('id, price, user_id, stock, status, variants')
-              .eq('id', rawListingId)
-              .maybeSingle();
-            listing = r.data;
-          }
-          if (!listing) {
-            const r = await supabase
-              .from('listings')
-              .select('id, price, user_id, stock, status, variants')
-              .ilike('id', `${rawListingId}%`)
-              .limit(1)
-              .maybeSingle();
-            if (r.data) listing = r.data;
+          const displayedAmount = Number(amount) || 0;
+          if (displayedAmount > 0 && finalAmount > displayedAmount + 100) {
+            return res.status(409).json({
+              success: false,
+              reason: 'amount_mismatch',
+              serverAmount: finalAmount,
+              message: `Le prix de la livraison a été recalculé : le total est de ${finalAmount} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser, ou mettez l'application à jour.`,
+            });
           }
         }
-
-        if (!listing) {
-          return res.status(404).json({ success: false, message: `Article introuvable (${rawListingId || '?'})` });
+        if (quoteId) await markQuoteUsed(supabase, quoteId, 'online');
+      } catch (err) {
+        if (err instanceof QuoteError) {
+          return res.status(err.status).json({ success: false, reason: err.reason, message: err.message });
         }
-        if (listing.status !== 'active') {
-          return res.status(409).json({ success: false, message: 'Un article du panier n’est plus disponible.' });
-        }
-
-        const quantity = Math.max(1, Math.floor(Number(oi?.quantity) || 1));
-        const variants = Array.isArray(listing.variants) ? listing.variants : [];
-        const selectedVariant = oi?.variant_id ? variants.find((v) => v.id === oi.variant_id) : null;
-
-        if (variants.length > 0 && (!selectedVariant || selectedVariant.active === false)) {
-          return res.status(400).json({ success: false, message: 'Veuillez choisir une taille valide.' });
-        }
-
-        const availableStock = selectedVariant ? Number(selectedVariant.stock) || 0 : Number(listing.stock) || 0;
-        if (availableStock < quantity) {
-          return res.status(409).json({ success: false, message: 'La quantité demandée n’est plus disponible.' });
-        }
-
-        const unitPrice = selectedVariant?.price != null ? Number(selectedVariant.price) : Number(listing.price);
-        if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-          return res.status(400).json({ success: false, message: 'Prix de l’article invalide.' });
-        }
-        const productAmount = unitPrice * quantity;
-
-        const { data: sellerProfile } = await supabase
-          .from('users')
-          .select('pro_until, shop_latitude, shop_longitude, district')
-          .eq('id', listing.user_id)
-          .single();
-        const isProSeller = sellerProfile?.pro_until ? new Date(sellerProfile.pro_until) > new Date() : false;
-        // Même règle que create_cod_order : commission imposée par l'admin
-        // (phase_config.seller_fee_override) si elle est définie, sinon taux
-        // standard. L'ancien calcul ignorait l'override et forçait 0 % en
-        // phase 0 : une même vente ne payait pas la même commission selon
-        // qu'elle était réglée en ligne ou à la livraison.
-        const feeOverride = phaseConfig.seller_fee_override;
-        const sellerFeeRate = feeOverride != null && Number.isFinite(Number(feeOverride))
-          ? Number(feeOverride)
-          : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
-
-        // Règle unique : GPS si exploitable, sinon barycentre du quartier
-        // déclaré, sinon centre de Daloa. Le repli par quartier manquait ici,
-        // toute boutique sans GPS était réputée au centre-ville.
-        const buyerDistrict = parseDistrictFromAddress(oi.delivery_address);
-        const sellerPoint = resolvePoint(
-          sellerProfile?.shop_latitude,
-          sellerProfile?.shop_longitude,
-          sellerProfile?.district,
-          districts
-        );
-        const buyerPoint = resolvePoint(oi.delivery_lat, oi.delivery_lng, buyerDistrict, districts);
-
-        const validSellerLat = sellerPoint.lat;
-        const validSellerLng = sellerPoint.lng;
-        const validDeliveryLat = buyerPoint.lat;
-        const validDeliveryLng = buyerPoint.lng;
-
-        // Distance routière réelle (Mapbox, repli OSRM puis vol d'oiseau × 1,3),
-        // la même cascade que celle affichée au client avant paiement.
-        const distanceKm = await resolveBillableDistanceKm(sellerPoint, buyerPoint);
-
-        const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
-        // Même règle que create_cod_order : hors phase 0, le retrait en boutique
-        // est réservé aux vendeurs Pro (sauf si l'admin le rouvre à tous).
-        if (isPickupMode && phaseConfig.allow_pickup_for_all === false && !isProSeller) {
-          return res.status(403).json({
-            success: false,
-            reason: 'pickup_not_allowed',
-            message: "Le retrait en boutique n'est pas disponible pour cet article.",
-          });
-        }
-        const alreadyCharged = sellersCharged.has(listing.user_id);
-        const deliveryFee = (isPickupMode || alreadyCharged) ? 0 : calculateDeliveryFee(distanceKm);
-        if (!isPickupMode) sellersCharged.add(listing.user_id);
-
-        const commission = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
-        const sellerCommission = Math.round(productAmount * sellerFeeRate);
-        const itemTotal = productAmount + deliveryFee + commission;
-        grandTotal += itemTotal;
-
-        metaItems.push({
-          listing_id: listing.id,
-          seller_id: listing.user_id,
-          variant_id: selectedVariant?.id || null,
-          variant_label: selectedVariant?.label || null,
-          unit_price: unitPrice,
-          quantity,
-          product_amount: productAmount,
-          delivery_fee: deliveryFee,
-          platform_fee: commission,
-          seller_amount: productAmount - sellerCommission,
-          delivery_address: oi.delivery_address || 'Daloa',
-          delivery_mode: oi.delivery_mode || 'delivery',
-          delivery_lat: validDeliveryLat,
-          delivery_lng: validDeliveryLng,
-          distance_km: Math.round(distanceKm * 10) / 10,
-        });
-      }
-
-      finalAmount = grandTotal;
-
-      // Le serveur fait foi, mais l'acheteur ne doit jamais découvrir un total
-      // plus élevé que celui qu'on lui a montré (ex. appli ancienne qui plaçait
-      // le vendeur au centre du quartier : 806 F affichés, 1 044 F facturés).
-      // Petite marge pour les écarts d'itinéraire entre appareil et serveur.
-      const displayedAmount = Number(amount) || 0;
-      if (displayedAmount > 0 && grandTotal > displayedAmount + 100) {
-        return res.status(409).json({
-          success: false,
-          reason: 'amount_mismatch',
-          serverAmount: grandTotal,
-          message: `Le prix de la livraison a été recalculé : le total est de ${grandTotal} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser, ou mettez l'application à jour.`,
-        });
+        throw err;
       }
 
       const { data: escrow, error: escrowErr } = await supabase
@@ -233,6 +157,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
             items: metaItems,
             delivery_address: metaItems[0].delivery_address,
             delivery_mode: metaItems[0].delivery_mode,
+            quote_id: quoteId,
           },
         })
         .select('id')
