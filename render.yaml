@@ -6,11 +6,39 @@ services:
     buildCommand: npm install
     startCommand: node index.js
     envVars:
-      - key: FUSION_API_URL
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
       - key: SITE_URL
         value: https://daloamarket.com
+      - key: PUBLIC_API_URL
+        value: https://api.daloamarket.com
+      - key: SUPABASE_URL
+        value: https://wjanjnoxzizxxhtbwyqd.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PAYMENT_PROVIDER
+        value: moneyfusion
+      - key: FUSION_API_URL
+        value: https://pay.moneyfusion.net/paiement/
+      - key: MONEYFUSION_PRIVATE_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        value: BCU8msD00uw2OYTKGZ_U-d-2cp2SPo7iQzkapnEP9hVsKzPf_eAZduYOqmmzGz58b0k-zT-Z3ogsymll11ZfRx4
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:contact@daloamarket.com
+      - key: ADMIN_SECRET
+        sync: false
+      - key: PUSH_WEBHOOK_SECRET
+        sync: false
+      - key: PAYOUT_WEBHOOK_SECRET
+        sync: false
+      - key: SASPAY_API_URL
+        value: https://api.saspay.me/api/v1
+      - key: SASPAY_API_KEY
+        sync: false
+      - key: SASPAY_WEBHOOK_SECRET
+        sync: false
