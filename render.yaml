@@ -21,7 +21,7 @@ services:
       - key: PAYMENT_PROVIDER
         value: moneyfusion
       - key: FUSION_API_URL
-        value: https://pay.moneyfusion.net/paiement/
+        value: https://pay.moneyfusion.net/DaloaMarket/3ac2127f34e0ec8c/pay/
       - key: MONEYFUSION_PRIVATE_KEY
         sync: false
       - key: VAPID_PUBLIC_KEY
