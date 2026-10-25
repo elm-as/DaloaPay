@@ -272,10 +272,14 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     }
 
     if (type === 'order') {
-      await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token }).eq('id', transactionId);
+      const { data: cur } = await supabase.from('escrow_transactions').select('order_metadata').eq('id', transactionId).maybeSingle();
+      const updatedMeta = { ...(cur?.order_metadata || {}), checkout_url: validPaymentUrl };
+      await supabase.from('escrow_transactions').update({ payment_reference: fusionData.token, order_metadata: updatedMeta }).eq('id', transactionId);
       return res.json({ success: true, token: fusionData.token, payment_url: validPaymentUrl, paymentUrl: validPaymentUrl, transactionId });
     } else {
-      await supabase.from('monetization_transactions').update({ provider_token: fusionData.token }).eq('id', transactionId);
+      const { data: curTx } = await supabase.from('monetization_transactions').select('metadata').eq('id', transactionId).maybeSingle();
+      const updatedMeta = { ...(curTx?.metadata || {}), checkout_url: validPaymentUrl };
+      await supabase.from('monetization_transactions').update({ provider_token: fusionData.token, metadata: updatedMeta }).eq('id', transactionId);
       return res.json({ success: true, transactionId, token: fusionData.token, paymentUrl: validPaymentUrl, payment_url: validPaymentUrl });
     }
   } catch (e) {
