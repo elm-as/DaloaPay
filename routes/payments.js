@@ -93,6 +93,20 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       });
     }
 
+    if (type === 'seller_badge' && phaseConfig.enable_seller_badge === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Le Pass Vendeur Pro est actuellement désactivé par l’administration.',
+      });
+    }
+
+    if (type.startsWith('credits_pack_') && phaseConfig.enable_boost === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Les options de boost et packs de crédits sont actuellement désactivées.',
+      });
+    }
+
     // Sélection du prestataire : priorité à la config DB (à chaud), sinon env var
     const activeProvider = payConfig.provider || ENV.PAYMENT_PROVIDER || 'moneyfusion';
 
@@ -182,8 +196,10 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     const baseUrl = ENV.SITE_URL.replace(/\/$/, '');
     const isApp = req.body.source === 'app' || req.body.platform === 'app';
     const sourceParam = isApp ? '&source=app' : '';
-    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${sourceParam}`;
-    const webhookUrl = `${req.protocol}://${req.get('host')}/payment-webhook`;
+    const host = req.get('host');
+    const webhookUrl = ENV.PUBLIC_API_URL
+      ? `${ENV.PUBLIC_API_URL}/payment-webhook`
+      : `https://${host}/payment-webhook`;
 
     let resolvedName = (customerName || '').trim();
     let cleanPhone = (customerPhone || '').trim().replace(/\s+/g, '');
