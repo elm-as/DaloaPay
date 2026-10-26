@@ -196,6 +196,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     const baseUrl = ENV.SITE_URL.replace(/\/$/, '');
     const isApp = req.body.source === 'app' || req.body.platform === 'app';
     const sourceParam = isApp ? '&source=app' : '';
+    const returnUrl = `${baseUrl}/payment/success?transactionId=${transactionId}&type=${type}${sourceParam}`;
     const host = req.get('host');
     const webhookUrl = ENV.PUBLIC_API_URL
       ? `${ENV.PUBLIC_API_URL}/payment-webhook`
