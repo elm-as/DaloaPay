@@ -44,7 +44,8 @@ async function sendExpoPush(expoPushToken, payload) {
       }
     }
 
-    const bodyText = [payload.subtitle, payload.body].filter(Boolean).join('\n');
+    // Le message (body) passe en premier pour être visible immédiatement sans déplier la notification
+    const bodyText = [payload.body, payload.subtitle].filter(Boolean).join('\n');
 
     const expoMessage = {
       to: expoPushToken,
@@ -114,7 +115,7 @@ function toWebPayload(p) {
   const isOrder = (p.tag || '').startsWith('order-');
   return {
     title: p.title,
-    body: [p.subtitle, p.body].filter(Boolean).join('\n'),
+    body: [p.body, p.subtitle].filter(Boolean).join('\n'),
     url: p.url || '/',
     tag: p.tag || 'daloamarket-notification',
     renotify: true,

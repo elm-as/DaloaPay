@@ -233,16 +233,14 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         listingPrice = listingRes.data?.price ? String(listingRes.data.price) : null;
       } catch (_) { /* non-bloquant */ }
 
-      const shortListing = truncate(listingTitle, 28) || null;
-      const priceLabel = listingPrice ? ` · ${formatFCFA(listingPrice)}` : '';
-
-      const notifTitle = senderName ? `💬 ${senderName}` : '💬 Nouveau message';
-      const notifSubtitle = shortListing ? `📌 ${shortListing}${priceLabel}` : undefined;
-      const notifBody = truncate(record.content, 100) || 'Vous avez reçu un nouveau message.';
+      const shortListing = truncate(listingTitle, 24) || null;
+      const notifTitle = senderName
+        ? (shortListing ? `💬 ${senderName} • ${shortListing}` : `💬 ${senderName}`)
+        : '💬 Nouveau message';
+      const notifBody = truncate(record.content, 140) || 'Vous avez reçu un nouveau message.';
 
       const payload = {
         title: notifTitle,
-        subtitle: notifSubtitle,
         body: notifBody,
         channelId: 'chat',
         // Sans annonce : conversation support (le web ne connaît pas « inbox »).
