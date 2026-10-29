@@ -213,14 +213,21 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       let listingTitle = null;
       let listingPhoto = null;
       let listingPrice = null;
+      let unreadCount = 1;
       try {
-        const [senderRes, listingRes] = await Promise.all([
+        const [senderRes, listingRes, unreadRes] = await Promise.all([
           record.sender_id
             ? supabase.from('users').select('full_name, shop_name, avatar_url').eq('id', record.sender_id).maybeSingle()
             : Promise.resolve({ data: null }),
           record.listing_id
             ? supabase.from('listings').select('title, photos, price').eq('id', record.listing_id).maybeSingle()
             : Promise.resolve({ data: null }),
+          supabase
+            .from('messages')
+            .select('id', { count: 'exact', head: true })
+            .eq('sender_id', record.sender_id)
+            .eq('receiver_id', targetUserId)
+            .eq('read', false),
         ]);
         // Un vendeur apparaît sous le nom de sa boutique, comme dans le chat.
         const shopName = senderRes.data?.shop_name?.trim();
@@ -231,12 +238,17 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         if (listingRes.data?.title) listingTitle = listingRes.data.title;
         listingPhoto = firstPhoto(listingRes.data?.photos);
         listingPrice = listingRes.data?.price ? String(listingRes.data.price) : null;
+
+        if (unreadRes && typeof unreadRes.count === 'number' && unreadRes.count > 0) {
+          unreadCount = unreadRes.count;
+        }
       } catch (_) { /* non-bloquant */ }
 
-      const shortListing = truncate(listingTitle, 24) || null;
+      const countBadge = unreadCount > 1 ? ` (${unreadCount} messages)` : '';
+      const shortListing = truncate(listingTitle, 20) || null;
       const notifTitle = senderName
-        ? (shortListing ? `💬 ${senderName} • ${shortListing}` : `💬 ${senderName}`)
-        : '💬 Nouveau message';
+        ? (shortListing ? `💬 ${senderName} • ${shortListing}${countBadge}` : `💬 ${senderName}${countBadge}`)
+        : `💬 Nouveau message${countBadge}`;
       const notifBody = truncate(record.content, 140) || 'Vous avez reçu un nouveau message.';
 
       const payload = {
@@ -246,7 +258,9 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         // Sans annonce : conversation support (le web ne connaît pas « inbox »).
         url: `/messages/${record.listing_id || 'support'}/${record.sender_id}`,
         tag: `chat-${record.sender_id}`,
-        image: listingPhoto,
+        // Pas d'image géante BigPicture au dépliage pour le chat (reste fluide et propre)
+        image: null,
+        badgeCount: unreadCount,
         chatPartnerId: record.sender_id,
         listingId: record.listing_id || null,
         partnerName: senderName || null,
