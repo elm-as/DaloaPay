@@ -10,6 +10,10 @@ function firstPhoto(photos) {
   return typeof first === 'string' && first.startsWith('http') ? first : null;
 }
 
+const truncate = (s, n) => (s && s.length > n ? s.slice(0, n).trimEnd() + '…' : s || '');
+const formatFCFA = (n) => `${Number(n).toLocaleString('fr-FR')} FCFA`;
+const orderRef = (id) => `#${String(id).slice(0, 6).toUpperCase()}`;
+
 // A. Broadcast vers tous les appareils abonnés (Admin / Annonces globales)
 router.post('/push/broadcast', requireAdminUser, async (req, res) => {
   try {
@@ -205,31 +209,40 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       if (!targetUserId) return res.json({ ok: true, skipped: 'no receiver_id' });
 
       let senderName = null;
+      let senderAvatar = null;
       let listingTitle = null;
       let listingPhoto = null;
+      let listingPrice = null;
       try {
         const [senderRes, listingRes] = await Promise.all([
           record.sender_id
-            ? supabase.from('users').select('full_name, shop_name').eq('id', record.sender_id).maybeSingle()
+            ? supabase.from('users').select('full_name, shop_name, avatar_url').eq('id', record.sender_id).maybeSingle()
             : Promise.resolve({ data: null }),
           record.listing_id
-            ? supabase.from('listings').select('title, photos').eq('id', record.listing_id).maybeSingle()
+            ? supabase.from('listings').select('title, photos, price').eq('id', record.listing_id).maybeSingle()
             : Promise.resolve({ data: null }),
         ]);
         // Un vendeur apparaît sous le nom de sa boutique, comme dans le chat.
         const shopName = senderRes.data?.shop_name?.trim();
         if (shopName) senderName = shopName;
         else if (senderRes.data?.full_name) senderName = senderRes.data.full_name.split(' ')[0];
+        senderAvatar = senderRes.data?.avatar_url || null;
+
         if (listingRes.data?.title) listingTitle = listingRes.data.title;
         listingPhoto = firstPhoto(listingRes.data?.photos);
+        listingPrice = listingRes.data?.price ? String(listingRes.data.price) : null;
       } catch (_) { /* non-bloquant */ }
 
-      const shortListing = listingTitle ? (listingTitle.length > 28 ? listingTitle.slice(0, 28) + '…' : listingTitle) : null;
-      const notifTitle = senderName ? (shortListing ? `💬 ${senderName} • ${shortListing}` : `💬 Message de ${senderName}`) : '💬 Nouveau message';
-      const notifBody = (record.content || '').length > 100 ? (record.content || '').slice(0, 100) + '…' : (record.content || 'Vous avez reçu un nouveau message.');
+      const shortListing = truncate(listingTitle, 28) || null;
+      const priceLabel = listingPrice ? ` · ${formatFCFA(listingPrice)}` : '';
+
+      const notifTitle = senderName ? `💬 ${senderName}` : '💬 Nouveau message';
+      const notifSubtitle = shortListing ? `📌 ${shortListing}${priceLabel}` : undefined;
+      const notifBody = truncate(record.content, 100) || 'Vous avez reçu un nouveau message.';
 
       const payload = {
         title: notifTitle,
+        subtitle: notifSubtitle,
         body: notifBody,
         channelId: 'chat',
         // Sans annonce : conversation support (le web ne connaît pas « inbox »).
@@ -238,6 +251,11 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         image: listingPhoto,
         chatPartnerId: record.sender_id,
         listingId: record.listing_id || null,
+        partnerName: senderName || null,
+        partnerAvatar: senderAvatar || null,
+        listingTitle: listingTitle || null,
+        listingPhoto: listingPhoto || null,
+        listingPrice: listingPrice || null,
       };
 
       const result = await sendPushToUser(targetUserId, payload, { appType: 'market' });
@@ -250,44 +268,39 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       const oldStatus = old_record?.status;
       if (status === oldStatus) return res.json({ ok: true, skipped: 'status inchangé' });
 
-      // Article concerné : son titre personnalise le texte, sa photo s'affiche
-      // en grand dans la notification web.
+      const ref = orderRef(record.id);
       let itemTitle = null;
       let itemPhoto = null;
       if (record.listing_id) {
         try {
           const { data: listing } = await supabase
             .from('listings').select('title, photos').eq('id', record.listing_id).maybeSingle();
-          itemTitle = listing?.title ? (listing.title.length > 40 ? listing.title.slice(0, 40) + '…' : listing.title) : null;
+          itemTitle = truncate(listing?.title, 40) || null;
           itemPhoto = firstPhoto(listing?.photos);
         } catch (_) { /* non-bloquant */ }
       }
-      const forItem = itemTitle ? ` « ${itemTitle} »` : '';
+      const forItem = itemTitle ? `\n📌 ${itemTitle}` : '';
 
       if (record.buyer_id) {
         let buyerTitle = '📦 Commande mise à jour';
-        let buyerMsg = 'Votre commande a été mise à jour.';
+        let buyerMsg = `Votre commande ${ref} a été mise à jour.`;
         if (status === 'paid') {
-          buyerTitle = '✅ Paiement confirmé !';
-          buyerMsg = `Votre commande${forItem} est en préparation. Vous serez notifié dès la prise en charge.`;
+          buyerTitle = '✅ Commande confirmée !';
+          buyerMsg = `Votre commande ${ref} est en préparation.${forItem}`;
         } else if (status === 'in_transit' || status === 'picked_up') {
-          // `orders.status` ne contient pas 'picked_up' : verify_pickup écrit
-          // 'in_transit'. Cette branche ne se déclenchait donc jamais.
           buyerTitle = '🛵 Livreur en route !';
-          buyerMsg = 'Votre colis a été récupéré. Le livreur fait route vers vous.';
+          buyerMsg = `Le livreur fait route vers vous avec votre colis ${ref}.${forItem}`;
         } else if (status === 'delivered') {
           buyerTitle = '🎉 Colis livré !';
-          buyerMsg = `Votre commande${forItem} a été remise. Merci pour votre confiance ❤️`;
+          buyerMsg = `Votre commande ${ref} a été remise en mains propres.${forItem}\nMerci pour votre confiance ❤️`;
         } else if (status === 'cancelled') {
-          // S'affichait « Commande mise à jour » : l'acheteur ne savait pas
-          // que sa commande était annulée.
           buyerTitle = '❌ Commande annulée';
           buyerMsg = record.payment_method === 'online'
-            ? `Votre commande${forItem} a été annulée. Le remboursement Mobile Money est en cours.`
-            : `Votre commande${forItem} a été annulée.`;
+            ? `Votre commande ${ref} a été annulée.${forItem}\nLe remboursement Mobile Money est en cours.`
+            : `Votre commande ${ref} a été annulée.${forItem}`;
         } else if (status === 'disputed') {
           buyerTitle = '⚠️ Litige ouvert';
-          buyerMsg = 'Un litige a été ouvert sur votre commande. Notre équipe intervient.';
+          buyerMsg = `Un litige a été ouvert sur la commande ${ref}.${forItem}\nNotre équipe intervient.`;
         }
 
         await sendPushToUser(record.buyer_id, {
@@ -306,13 +319,12 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         let sellerMsg = null;
         if (status === 'paid') {
           sellerTitle = '🎉 Nouvelle vente !';
-          sellerMsg = `Paiement reçu pour${forItem || ' votre article'} : préparez le colis. 📦`;
+          sellerMsg = `Paiement reçu pour la commande ${ref}.${forItem}\nPréparez le colis pour le livreur. 📦`;
         } else if (status === 'delivered') {
           sellerTitle = '✅ Livraison validée';
-          // En espèces, le vendeur a déjà encaissé : aucun virement à annoncer.
           sellerMsg = record.payment_method === 'online'
-            ? 'Votre colis a été remis. Votre virement Mobile Money est programmé.'
-            : 'Votre colis a été remis. La commande est clôturée.';
+            ? `Le colis ${ref} a été remis au client.${forItem}\nVotre virement Mobile Money est programmé.`
+            : `Le colis ${ref} a été remis au client.${forItem}\nLa commande est clôturée.`;
         }
 
         if (sellerMsg) {
@@ -335,7 +347,7 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
     if (table === 'delivery_assignments') {
       const status = record.status;
       const oldStatus = old_record?.status;
-      const priceText = record.delivery_price ? `${Number(record.delivery_price).toLocaleString('fr-FR')} FCFA` : 'Rémunérée';
+      const priceText = record.delivery_price ? formatFCFA(record.delivery_price) : 'Rémunérée';
       // Lien ouvert par le site livreur (/course/:id). L'app livreur, elle,
       // route sur le `tag` (delivery-assign-<id> / delivery-open-<id>).
       const courseUrl = `/course/${record.id}`;
@@ -346,7 +358,7 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
           if (dp?.user_id) {
             await sendPushToUser(dp.user_id, {
               title: '🛵 Nouvelle course assignée !',
-              body: `Une livraison vous a été confiée à Daloa (${priceText}). Ouvrez l'application pour démarrer.`,
+              body: `Une livraison vous a été confiée à Daloa (${priceText}).\nOuvrez l'application pour démarrer.`,
               url: courseUrl,
               tag: `delivery-assign-${record.id}`,
             }, { appType: 'delivery' });
@@ -379,8 +391,8 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             for (const driver of drivers) {
               if (driver.user_id) {
                 sendPushToUser(driver.user_id, {
-                  title: '🛵 Nouvelle course disponible !',
-                  body: `Livraison à Daloa • Gain : ${priceText}. Premier arrivé, premier servi ! ⚡`,
+                  title: `🛵 Course disponible · ${priceText}`,
+                  body: `Livraison à Daloa • Premier arrivé, premier servi ! ⚡`,
                   url: courseUrl,
                   tag: `delivery-open-${record.id}`,
                 }, { appType: 'delivery' }).catch((err) => console.warn('[Push Delivery Error]:', err));

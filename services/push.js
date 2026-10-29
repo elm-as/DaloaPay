@@ -44,18 +44,25 @@ async function sendExpoPush(expoPushToken, payload) {
       }
     }
 
+    const bodyText = [payload.subtitle, payload.body].filter(Boolean).join('\n');
+
     const expoMessage = {
       to: expoPushToken,
       sound: 'default',
       title: payload.title,
-      subtitle: payload.subtitle || undefined,
-      body: payload.body,
+      body: bodyText,
+      richContent: payload.image ? { image: payload.image } : undefined,
       data: {
         url: payload.url || '/',
         tag: payload.tag,
         orderId,
         chatPartnerId,
         listingId,
+        partnerName: payload.partnerName || null,
+        partnerAvatar: payload.partnerAvatar || null,
+        listingTitle: payload.listingTitle || null,
+        listingPhoto: payload.listingPhoto || payload.image || null,
+        listingPrice: payload.listingPrice || null,
       },
       priority: 'high',
       channelId: payload.channelId || 'default',
@@ -72,16 +79,61 @@ async function sendExpoPush(expoPushToken, payload) {
     });
 
     const data = await res.json();
-    if (data?.data?.status === 'ok') {
+    const ticket = data?.data;
+    if (ticket?.status === 'ok') {
       return { success: true };
-    } else {
-      console.warn('[ExpoPush] Push send warning:', data?.data?.message || data?.errors);
-      return { success: false, error: data?.data?.message };
     }
+
+    if (ticket?.details?.error === 'DeviceNotRegistered') {
+      try {
+        const supabase = getSupabaseAdminClient();
+        if (supabase) {
+          await supabase
+            .from('push_subscriptions')
+            .update({ is_active: false })
+            .eq('expo_push_token', expoPushToken);
+          console.log(`[ExpoPush] Désactivation token expiré (DeviceNotRegistered): ${expoPushToken.slice(0, 30)}...`);
+        }
+      } catch (_) {
+        /* non-bloquant */
+      }
+    }
+
+    console.warn('[ExpoPush] Push send warning:', ticket?.message || data?.errors);
+    return { success: false, error: ticket?.message || 'Erreur envoi push' };
   } catch (err) {
     console.error('[ExpoPush] Exception:', err.message);
     return { success: false, error: err.message };
   }
+}
+
+function toWebPayload(p) {
+  if (typeof p === 'string') return p;
+  const isChat = (p.tag || '').startsWith('chat-');
+  const isCourse = (p.tag || '').startsWith('delivery-');
+  const isOrder = (p.tag || '').startsWith('order-');
+  return {
+    title: p.title,
+    body: [p.subtitle, p.body].filter(Boolean).join('\n'),
+    url: p.url || '/',
+    tag: p.tag || 'daloamarket-notification',
+    renotify: true,
+    image: p.image || null,
+    icon: p.partnerAvatar || p.icon || '/web-app-manifest-192x192.png',
+    badge: '/notification-badge.png',
+    actions: isChat
+      ? [{ action: 'open', title: '💬 Ouvrir le chat' }, { action: 'dismiss', title: 'Fermer' }]
+      : isCourse
+      ? [{ action: 'open', title: '🛵 Voir la course' }, { action: 'dismiss', title: 'Fermer' }]
+      : isOrder
+      ? [{ action: 'open', title: '📦 Voir la commande' }, { action: 'dismiss', title: 'Fermer' }]
+      : [{ action: 'open', title: 'Ouvrir' }, { action: 'dismiss', title: 'Fermer' }],
+    data: {
+      url: p.url || '/',
+      orderId: p.orderId || null,
+      chatPartnerId: p.chatPartnerId || null,
+    },
+  };
 }
 
 async function sendWebPush(subscription, payload) {
@@ -93,7 +145,7 @@ async function sendWebPush(subscription, payload) {
         auth: subscription.keys_auth,
       },
     };
-    const stringPayload = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    const stringPayload = JSON.stringify(toWebPayload(payload));
     await webpush.sendNotification(pushSubscription, stringPayload);
     return { success: true };
   } catch (err) {
