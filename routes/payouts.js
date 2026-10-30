@@ -209,12 +209,17 @@ router.post('/retry-payout/:id', allowSecretOrAuthenticatedUser, payoutLimiter, 
     }
 
     const payoutId = req.params.id;
-    const { error: resetErr } = await supabase
+    const { data: updatedRows, error: resetErr } = await supabase
       .from('payouts')
       .update({ status: 'pending', failure_reason: null })
-      .eq('id', payoutId);
+      .eq('id', payoutId)
+      .eq('status', 'failed')
+      .select('id');
 
     if (resetErr) throw resetErr;
+    if (!updatedRows || updatedRows.length === 0) {
+      return res.status(409).json({ success: false, message: 'Seuls les versements en échec peuvent être relancés.' });
+    }
 
     return res.json({ success: true, message: 'Versement réinitialisé en attente avec succès.' });
   } catch (e) {

@@ -2,10 +2,7 @@
  * Devis de commande — le seul calcul qui fait foi.
  *
  * Utilisé par `POST /quote` (le client l'affiche tel quel) et par
- * `POST /create-payment` sans devis (anciennes applications). Avant, chaque
- * client calculait son propre prix pour l'afficher et le serveur recalculait
- * au paiement : deux calculs sur des données différentes (annonce en cache,
- * itinéraire obtenu deux fois), d'où 806 F affichés et 1 044 F facturés.
+ * `POST /create-payment` sans devis (anciennes applications).
  */
 
 const {
@@ -18,6 +15,7 @@ const {
 } = require('./pricing');
 
 const QUOTE_TTL_MINUTES = 15;
+const GROUPED_ADDITIONAL_STOP_FEE = 300;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 class QuoteError extends Error {
@@ -33,14 +31,14 @@ async function loadListing(supabase, rawListingId) {
   if (UUID_RE.test(rawListingId)) {
     const r = await supabase
       .from('listings')
-      .select('id, price, user_id, stock, status, variants')
+      .select('id, price, user_id, category, stock, status, variants')
       .eq('id', rawListingId)
       .maybeSingle();
     if (r.data) return r.data;
   }
   const r = await supabase
     .from('listings')
-    .select('id, price, user_id, stock, status, variants')
+    .select('id, price, user_id, category, stock, status, variants')
     .ilike('id', `${rawListingId}%`)
     .limit(1)
     .maybeSingle();
@@ -77,10 +75,8 @@ function resolveLine(listing, oi) {
 }
 
 /**
- * Calcule un devis complet.
+ * Calcule un devis complet (incluant produits numériques 0 F et tarif groupé multi-vendeurs F06).
  * @returns {{ items, sellers, buyerPoint, deliveryMode, totals }}
- *   items   : lignes prêtes pour l'escrow (même forme que order_metadata.items)
- *   sellers : une entrée par vendeur {seller_id, distance_km, delivery_fee, buyer_fee, product_amount}
  */
 async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
@@ -97,6 +93,7 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
     const listing = await loadListing(supabase, oi?.listing_id);
     const { quantity, selectedVariant, unitPrice } = resolveLine(listing, oi);
     const productAmount = unitPrice * quantity;
+    const isDigital = listing.category === 'digital';
 
     const { data: sellerProfile } = await supabase
       .from('users')
@@ -109,16 +106,12 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
       ? Number(feeOverride)
       : (isProSeller ? PRICING.PRO_SELLER_FEE_RATE : PRICING.SELLER_FEE_RATE);
 
-    const isPickupMode = oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
-    // Même règle que create_cod_order : hors phase de lancement, le retrait en
-    // boutique est réservé aux vendeurs Pro (sauf si l'admin le rouvre à tous).
-    if (isPickupMode && phaseConfig.allow_pickup_for_all === false && !isProSeller) {
+    const isPickupMode = isDigital || oi?.delivery_mode === 'pickup' || oi?.delivery_mode === 'pickup_point';
+    if (isPickupMode && !isDigital && phaseConfig.allow_pickup_for_all === false && !isProSeller) {
       throw new QuoteError(403, "Le retrait en boutique n'est pas disponible pour cet article.", 'pickup_not_allowed');
     }
     deliveryMode = isPickupMode ? 'pickup_point' : 'delivery';
 
-    // Règle unique : GPS si exploitable, sinon barycentre du quartier déclaré,
-    // sinon centre de Daloa.
     const buyerDistrict = oi?.delivery_district || parseDistrictFromAddress(oi?.delivery_address);
     const pointB = resolvePoint(oi?.delivery_lat, oi?.delivery_lng, buyerDistrict, districts);
     if (!buyerPoint) buyerPoint = { ...pointB, district: buyerDistrict || null };
@@ -131,7 +124,6 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
         sellerProfile?.district,
         districts
       );
-      // Une seule course par vendeur, à sa distance réelle.
       const distanceKm = isPickupMode ? 0 : await resolveBillableDistanceKm(sellerPoint, pointB);
       seller = {
         seller_id: listing.user_id,
@@ -157,20 +149,48 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
       unit_price: unitPrice,
       quantity,
       product_amount: productAmount,
-      // La livraison du vendeur est portée par sa première ligne.
       delivery_fee: seller.first ? seller.delivery_fee : 0,
       platform_fee: buyerFee,
       seller_amount: productAmount - sellerCommission,
       delivery_address: oi?.delivery_address || 'Daloa',
-      delivery_mode: oi?.delivery_mode || 'delivery',
+      delivery_mode: isPickupMode ? 'pickup_point' : 'delivery',
       delivery_lat: pointB.lat,
       delivery_lng: pointB.lng,
       distance_km: seller.distance_km,
+      is_first_for_seller: seller.first,
     });
     seller.first = false;
   }
 
-  const sellerList = Array.from(sellers.values()).map(({ first, ...s }) => s);
+  // Application de la tarification dégressive multi-vendeurs (F06 : +300 FCFA par stop additionnel)
+  const sellerEntries = Array.from(sellers.values());
+  if (deliveryMode === 'delivery' && sellerEntries.length > 1) {
+    let primarySellerId = sellerEntries[0].seller_id;
+    let maxFee = -1;
+    for (const s of sellerEntries) {
+      if (s.delivery_fee > maxFee) {
+        maxFee = s.delivery_fee;
+        primarySellerId = s.seller_id;
+      }
+    }
+    for (const s of sellerEntries) {
+      if (s.seller_id !== primarySellerId && s.delivery_fee > 0) {
+        s.delivery_fee = Math.min(s.delivery_fee, GROUPED_ADDITIONAL_STOP_FEE);
+      }
+    }
+    for (const item of items) {
+      if (item.is_first_for_seller) {
+        const s = sellers.get(item.seller_id);
+        item.delivery_fee = s ? s.delivery_fee : item.delivery_fee;
+      }
+    }
+  }
+
+  for (const item of items) {
+    delete item.is_first_for_seller;
+  }
+
+  const sellerList = sellerEntries.map(({ first, ...s }) => s);
   const productTotal = items.reduce((s, i) => s + i.product_amount, 0);
   const deliveryTotal = sellerList.reduce((s, x) => s + x.delivery_fee, 0);
   const buyerFeeTotal = items.reduce((s, i) => s + i.platform_fee, 0);

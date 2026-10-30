@@ -1,23 +1,13 @@
 const crypto = require('crypto');
 const { sendPushToUser } = require('./push');
-
-// Tarification : une seule implémentation, partagée avec `payments.js` et
-// vérifiée par le test de parité. Ce fichier en portait sa propre copie.
 const { PRICING, haversineDistance, calculateDeliveryFee } = require('./pricing');
 
 const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
 /**
- * Crée l'order + delivery_assignment UNIQUEMENT quand le paiement est confirmé.
- *
- * Idempotent, y compris en cas d'appels simultanés : le webhook MoneyFusion et
- * le polling `check-payment` arrivent souvent ensemble. Ils lisaient tous deux
- * `order_id = null` et créaient chacun la commande (doublon + stock décrémenté
- * deux fois). L'escrow est maintenant réservé par un UPDATE conditionnel
- * `pending → funded` ; seul l'appel qui l'obtient crée la commande.
- *
- * @returns {Promise<string|null>} order_id, ou null si un autre appel est en
- *   train de la créer.
+ * Crée les commandes et courses à partir d'un séquestre financé.
+ * Idempotent et atomique : un UPDATE conditionnel `pending → funded` garantit
+ * qu'un seul appel (webhook ou polling) crée les commandes.
  */
 async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   if (escrow.order_id) {
@@ -45,8 +35,6 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   try {
     return await createOrdersForClaimedEscrow(supabase, escrow, personalInfo);
   } catch (err) {
-    // Rien n'a été créé de façon exploitable : on rend l'escrow pour que la
-    // prochaine notification réessaie.
     await supabase
       .from('escrow_transactions')
       .update({ status: 'pending', funded_at: null })
@@ -57,11 +45,8 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
 }
 
 async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
-
   const meta = escrow.order_metadata || {};
-
-  const rawItems =
-    Array.isArray(meta.items) && meta.items.length > 0 ? meta.items : [meta];
+  const rawItems = Array.isArray(meta.items) && meta.items.length > 0 ? meta.items : [meta];
   const isLegacySingle = rawItems.length === 1 && meta.items == null;
 
   const items = rawItems.map((i) => ({
@@ -80,11 +65,15 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     delivery_fee: i.delivery_fee != null ? i.delivery_fee : isLegacySingle ? escrow.delivery_fee || 0 : 0,
     platform_fee: i.platform_fee != null ? i.platform_fee : isLegacySingle ? escrow.platform_fee || 0 : 0,
     seller_amount: i.seller_amount != null ? i.seller_amount : isLegacySingle ? escrow.seller_amount : null,
+    delivery_lat: i.delivery_lat ?? null,
+    delivery_lng: i.delivery_lng ?? null,
+    distance_km: i.distance_km ?? null,
   }));
 
   const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
   const deliveryMode = meta.delivery_mode || personalInfo?.delivery_mode || 'delivery';
   const isPickup = deliveryMode === 'pickup_point' || deliveryMode === 'pickup';
+  const requestedDaloaCash = Math.max(0, Number(meta.daloa_cash_discount) || 0);
 
   const groups = new Map();
   for (const it of items) {
@@ -93,21 +82,23 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
   }
 
   let firstOrderId = null;
+  const orderIds = [];
+  let sellerIndex = 0;
 
   for (const [sellerId, group] of groups.entries()) {
     const productAmount = group.reduce((s, i) => s + (i.product_amount || 0), 0);
     const deliveryFee = group.reduce((s, i) => s + (i.delivery_fee || 0), 0);
     const platformFee = group.reduce((s, i) => s + (i.platform_fee || 0), 0);
-    // `platform_fee` des articles = frais de service ACHETEUR. En base,
-    // `orders.platform_commission` porte la commission VENDEUR et `reserve_fee`
-    // les frais acheteur (create_cod_order, record_cod_receivable, rapports).
-    // Les commandes en ligne inversaient les deux.
-    const sellerCommission = group.reduce(
-      (s, i) => s + (i.seller_amount != null ? Math.max(0, (i.product_amount || 0) - i.seller_amount) : 0),
+    const sellerNetAmount = group.reduce(
+      (s, i) => s + (i.seller_amount != null ? i.seller_amount : (i.product_amount || 0)),
       0
     );
+    const sellerCommission = Math.max(0, productAmount - sellerNetAmount);
+    const driverCommission = Math.round(deliveryFee * 0.10);
+    const driverNetAmount = Math.max(0, deliveryFee - driverCommission);
     const totalQuantity = group.reduce((s, i) => s + i.quantity, 0);
-    const orderTotal = productAmount + deliveryFee + platformFee;
+    const orderDaloaCash = sellerIndex === 0 ? Math.min(requestedDaloaCash, deliveryFee) : 0;
+    const orderTotal = Math.max(0, productAmount + deliveryFee + platformFee - orderDaloaCash);
     const first = group[0];
 
     const { data: order, error: orderErr } = await supabase
@@ -124,9 +115,13 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
         delivery_fee: deliveryFee,
         platform_commission: sellerCommission,
         reserve_fee: platformFee,
+        daloa_cash_discount: orderDaloaCash,
         total_amount: orderTotal,
         delivery_address: address,
         delivery_mode: deliveryMode,
+        delivery_lat: isPickup ? null : first.delivery_lat,
+        delivery_lng: isPickup ? null : first.delivery_lng,
+        distance_km: first.distance_km,
         status: 'paid',
       })
       .select('id')
@@ -136,11 +131,47 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       console.error('Order creation error:', orderErr);
       throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
     }
-    if (!firstOrderId) {
+
+    orderIds.push(order.id);
+
+    if (sellerIndex === 0) {
       firstOrderId = order.id;
-      // Inscrit tout de suite : si la suite échoue, l'escrow n'est plus remis
-      // en attente (voir createOrderFromEscrow) et rien n'est recréé.
-      await supabase.from('escrow_transactions').update({ order_id: order.id }).eq('id', escrow.id);
+      // Mise à jour du séquestre principal avec les montants exacts du vendeur 1
+      await supabase
+        .from('escrow_transactions')
+        .update({
+          order_id: order.id,
+          seller_id: sellerId,
+          total_amount: orderTotal,
+          seller_amount: sellerNetAmount,
+          driver_amount: driverNetAmount,
+          delivery_fee: deliveryFee,
+          platform_fee: platformFee + sellerCommission + driverCommission,
+        })
+        .eq('id', escrow.id);
+    } else {
+      // Séquestre dédié pour chaque vendeur supplémentaire afin que verify_delivery
+      // et complete_pickup_order déclenchent le versement exact de chaque vendeur et livreur.
+      await supabase.from('escrow_transactions').insert({
+        order_id: order.id,
+        buyer_id: escrow.buyer_id,
+        seller_id: sellerId,
+        total_amount: orderTotal,
+        seller_amount: sellerNetAmount,
+        driver_amount: driverNetAmount,
+        delivery_fee: deliveryFee,
+        platform_fee: platformFee + sellerCommission + driverCommission,
+        status: 'funded',
+        funded_at: escrow.funded_at || new Date().toISOString(),
+        payment_method: escrow.payment_method || 'mobile_money',
+        payment_reference: escrow.payment_reference ? `${escrow.payment_reference}_s${sellerIndex + 1}` : null,
+        order_metadata: {
+          parent_escrow_id: escrow.id,
+          items: group,
+          delivery_address: address,
+          delivery_mode: deliveryMode,
+        },
+      });
     }
 
     const itemsPayload = group.map((i) => ({
@@ -157,7 +188,6 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       console.error('order_items creation error:', itemsErr.message);
     }
 
-    // Décrémenter le stock de chaque article et marquer comme vendu si stock = 0
     for (const it of group) {
       try {
         const { data: curListing } = await supabase
@@ -220,12 +250,52 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
         orderId: order.id,
       }).catch((e) => console.error('[Push Order Error]:', e));
     }
+
+    sellerIndex += 1;
   }
 
-  await supabase
-    .from('escrow_transactions')
-    .update({ order_id: firstOrderId })
-    .eq('id', escrow.id);
+  // Déduction effective du solde Daloa Cash de l'acheteur après confirmation du paiement
+  if (requestedDaloaCash > 0 && firstOrderId && escrow.buyer_id) {
+    try {
+      const { data: buyerRow } = await supabase
+        .from('users')
+        .select('daloa_cash_balance')
+        .eq('id', escrow.buyer_id)
+        .maybeSingle();
+      const curBalance = Number(buyerRow?.daloa_cash_balance) || 0;
+      const deducted = Math.min(curBalance, requestedDaloaCash);
+      if (deducted > 0) {
+        await supabase
+          .from('users')
+          .update({ daloa_cash_balance: Math.max(0, curBalance - deducted) })
+          .eq('id', escrow.buyer_id);
+        await supabase.from('daloa_cash_transactions').insert({
+          user_id: escrow.buyer_id,
+          amount: -deducted,
+          type: 'checkout_discount',
+          order_id: firstOrderId,
+          notes: 'Réduction Daloa Cash appliquée sur paiement Mobile Money',
+        });
+      }
+    } catch (dcErr) {
+      console.error('[escrow] Erreur déduction Daloa Cash:', dcErr);
+    }
+  }
+
+  // Initialisation de la tournée groupée multi-vendeurs (F06) si >= 2 vendeurs en livraison
+  if (!isPickup && orderIds.length > 1) {
+    try {
+      await supabase.rpc('setup_grouped_delivery_run', {
+        p_order_ids: orderIds,
+        p_dropoff_address: address,
+        p_dropoff_district: null,
+        p_dropoff_lat: items[0]?.delivery_lat ?? null,
+        p_dropoff_lng: items[0]?.delivery_lng ?? null,
+      });
+    } catch (grpErr) {
+      console.error('[escrow] Erreur initialisation livraison groupée:', grpErr);
+    }
+  }
 
   return firstOrderId;
 }

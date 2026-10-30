@@ -57,7 +57,6 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
 
 // 1) Créer un paiement (Order Escrow ou Monétisation) — MoneyFusion ou SasPay
 router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
-  console.log('POST /create-payment received', req.body);
   try {
     checkConfig();
     const { type, amount, plan, customerName, customerPhone, metadata, orderInput, orderInputs } = req.body;
@@ -107,7 +106,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       });
     }
 
-    // Sélection du prestataire : priorité à la config DB (à chaud), sinon env var
     const activeProvider = payConfig.provider || ENV.PAYMENT_PROVIDER || 'moneyfusion';
 
     let transactionId = '';
@@ -117,6 +115,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
     if (type === 'order') {
       let metaItems;
       let quoteId = null;
+      let appliedDaloaCash = 0;
       try {
         if (req.body.quoteId) {
           const quote = await loadQuoteForPayment(supabase, req.body.quoteId, userId);
@@ -141,6 +140,26 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
             });
           }
         }
+
+        // Validation serveur de la réduction Daloa Cash (F10)
+        const deliveryTotal = metaItems.reduce((s, i) => s + (i.delivery_fee || 0), 0);
+        const explicitDiscount = Number(req.body.daloaCashDiscount ?? req.body.daloa_cash_discount ?? metadata?.daloaCashDiscount ?? 0) || 0;
+        const implicitDiscount = quoteId && Number(amount) > 0 && Number(amount) < finalAmount
+          ? finalAmount - Number(amount)
+          : 0;
+        const requestedDiscount = Math.max(explicitDiscount, implicitDiscount);
+
+        if (requestedDiscount > 0 && deliveryTotal > 0) {
+          const { data: buyerRow } = await supabase
+            .from('users')
+            .select('daloa_cash_balance')
+            .eq('id', userId)
+            .maybeSingle();
+          const availableBalance = Math.max(0, Number(buyerRow?.daloa_cash_balance) || 0);
+          appliedDaloaCash = Math.min(requestedDiscount, availableBalance, deliveryTotal);
+          finalAmount = Math.max(0, finalAmount - appliedDaloaCash);
+        }
+
         if (quoteId) await markQuoteUsed(supabase, quoteId, 'online');
       } catch (err) {
         if (err instanceof QuoteError) {
@@ -166,6 +185,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
             delivery_address: metaItems[0].delivery_address,
             delivery_mode: metaItems[0].delivery_mode,
             quote_id: quoteId,
+            daloa_cash_discount: appliedDaloaCash,
           },
         })
         .select('id')
@@ -233,7 +253,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       credits_pack_30: 'Pack Or (30 crédits de boost)',
     };
 
-    // BRANCH 1 : Prestataire SasPay
     if (activeProvider === 'saspay') {
       if (!resolvedEmail) resolvedEmail = `client_${userId.slice(0, 8)}@daloamarket.com`;
       const saspayRes = await createCheckoutSession({
@@ -267,7 +286,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       }
     }
 
-    // BRANCH 2 : Prestataire MoneyFusion (par défaut)
     const fusionPayload = {
       totalPrice: Math.round(finalAmount),
       article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],
