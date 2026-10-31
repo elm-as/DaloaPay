@@ -5,6 +5,7 @@ const { payoutLimiter } = require('../config/rate-limiters');
 const { allowSecretOrAuthenticatedUser, requireWebhookSecret } = require('../middlewares/auth');
 const { sendWithdraw } = require('../services/moneyfusion');
 const { sendSasPayPayout } = require('../services/saspay');
+const { sendPushToUser } = require('../services/push');
 
 // 3) Traitement des Payouts (MoneyFusion ou SasPay selon configuration)
 router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, async (req, res) => {
@@ -62,7 +63,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
       });
     }
 
-    // Récupérer le provider actif
     const { data: payRow } = await supabase
       .from('system_settings')
       .select('value')
@@ -80,7 +80,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
         continue;
       }
 
-      // Verrouillage atomique en base
       const { data: locked, error: lockErr } = await supabase
         .from('payouts')
         .update({ status: 'processing' })
@@ -95,7 +94,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
 
       try {
         if (activeProvider === 'saspay') {
-          // Payout SasPay
           const result = await sendSasPayPayout({
             amount: payout.amount,
             phone: payout.recipient_phone,
@@ -115,7 +113,6 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
             results.push({ id: payout.id, status: 'failed', reason: result.message, provider: 'saspay' });
           }
         } else {
-          // Payout MoneyFusion
           if (!MONEYFUSION_PRIVATE_KEY) {
             await supabase.from('payouts').update({ status: 'failed', failure_reason: 'MONEYFUSION_PRIVATE_KEY manquante' }).eq('id', payout.id);
             results.push({ id: payout.id, status: 'failed', reason: 'Clé privée MoneyFusion manquante' });
@@ -241,15 +238,39 @@ router.post('/payout-webhook', requireWebhookSecret(ENV.PAYOUT_WEBHOOK_SECRET, '
     const isCancelled = event === 'payout.session.cancelled' || event === 'payout.failed';
 
     if (isSuccess) {
-      await supabase
+      const { data: updated } = await supabase
         .from('payouts')
         .update({ status: 'paid', completed_at: new Date().toISOString() })
-        .eq('provider_token', refToken);
+        .eq('provider_token', refToken)
+        .select('id, recipient_id, recipient_type, net_amount')
+        .maybeSingle();
+      if (updated?.recipient_id) {
+        const isDriver = updated.recipient_type === 'delivery';
+        const amt = Number(updated.net_amount || 0).toLocaleString('fr-FR');
+        sendPushToUser(updated.recipient_id, {
+          title: '💸 Versement Mobile Money envoyé !',
+          body: `Votre virement de ${amt} FCFA a été crédité sur votre compte Mobile Money.`,
+          url: isDriver ? '/earnings' : '/mes-paiements',
+          tag: `payout-${updated.id}`,
+        }, { appType: isDriver ? 'delivery' : 'market' }).catch(() => {});
+      }
     } else if (isCancelled) {
-      await supabase
+      const { data: updated } = await supabase
         .from('payouts')
         .update({ status: 'failed', failure_reason: message || 'Annulé par passerelle de paiement' })
-        .eq('provider_token', refToken);
+        .eq('provider_token', refToken)
+        .select('id, recipient_id, recipient_type, net_amount')
+        .maybeSingle();
+      if (updated?.recipient_id) {
+        const isDriver = updated.recipient_type === 'delivery';
+        const amt = Number(updated.net_amount || 0).toLocaleString('fr-FR');
+        sendPushToUser(updated.recipient_id, {
+          title: '⚠️ Échec du versement Mobile Money',
+          body: `Le virement de ${amt} FCFA n'a pas abouti. Vérifiez votre numéro de retrait.`,
+          url: isDriver ? '/payout-setup' : '/settings/payout',
+          tag: `payout-${updated.id}`,
+        }, { appType: isDriver ? 'delivery' : 'market' }).catch(() => {});
+      }
     }
 
     return res.json({ ok: true });
