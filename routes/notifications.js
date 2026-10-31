@@ -4,7 +4,6 @@ const { ENV, getSupabaseAdminClient } = require('../config/env');
 const { requireAuthenticatedUser, requireAdminUser, requireAdminSecret, requireWebhookSecret } = require('../middlewares/auth');
 const { broadcastPush, sendPushToUser } = require('../services/push');
 
-/** Première photo d'une annonce (URL publique), ou null. */
 function firstPhoto(photos) {
   const first = Array.isArray(photos) ? photos[0] : null;
   return typeof first === 'string' && first.startsWith('http') ? first : null;
@@ -50,10 +49,6 @@ router.post('/push/broadcast', requireAdminUser, async (req, res) => {
 });
 
 // B. Notification ciblée pour un utilisateur spécifique — administration uniquement.
-// Elle était ouverte à tout utilisateur connecté, avec titre, texte et lien
-// libres : n'importe qui pouvait envoyer une fausse notification à n'importe
-// quel compte. Les notifications de chat sont émises par la base (trigger
-// push_webhook_messages → /push/webhook), à partir du vrai message.
 router.post('/push/notify-user', requireAdminUser, async (req, res) => {
   try {
     const { targetUserId, title, body, url, tag, image, chatPartnerId, listingId, orderId, appType } = req.body || {};
@@ -151,15 +146,9 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
         console.error('[Push Register Expo] ❌ Erreur insertion Supabase:', error.message);
         return res.status(500).json({ success: false, message: error.message });
       }
-
-      console.log(`[Push Register Expo] ✅ Token Expo enregistré pour user ${user_id} (${app_type || 'market'})`);
       return res.json({ success: true, type: 'expo' });
     }
 
-    // `app_type` et `is_active` étaient omis ici : un abonnement web était donc
-    // rangé par défaut avec les acheteurs ('market'). Un livreur qui s'abonnait
-    // depuis le tableau de bord web restait invisible pour tout envoi ciblé
-    // 'delivery'.
     const { error } = await supabase.from('push_subscriptions').upsert(
       {
         user_id,
@@ -174,15 +163,11 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
       { onConflict: 'user_id,endpoint' }
     );
 
-    if (error) {
-      if (error.code === '23505') {
-        return res.json({ success: true, duplicate: true });
-      }
+    if (error && error.code !== '23505') {
       console.error('[Push Register] ❌ Erreur insertion Supabase:', error.message);
       return res.status(500).json({ success: false, message: error.message });
     }
 
-    console.log(`[Push Register] ✅ Token Web enregistré pour user ${user_id} (endpoint: ${endpoint.slice(0, 60)}...)`);
     return res.json({ success: true, type: 'web' });
   } catch (err) {
     console.error('[Push Register] Exception:', err);
@@ -192,8 +177,6 @@ router.post('/push/register', requireAuthenticatedUser, async (req, res) => {
 
 // E. Webhook Supabase Database Trigger
 router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-push-webhook-secret'), async (req, res) => {
-  // Pas de refus global sans clés VAPID : elles ne servent qu'au web push, les
-  // apps (Expo) doivent continuer à recevoir leurs notifications.
   const { type, table, record, old_record } = req.body || {};
   if (!record || !table) {
     return res.status(400).json({ ok: false, error: 'Payload webhook invalide' });
@@ -229,7 +212,6 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             .eq('receiver_id', targetUserId)
             .eq('read', false),
         ]);
-        // Un vendeur apparaît sous le nom de sa boutique, comme dans le chat.
         const shopName = senderRes.data?.shop_name?.trim();
         if (shopName) senderName = shopName;
         else if (senderRes.data?.full_name) senderName = senderRes.data.full_name.split(' ')[0];
@@ -255,10 +237,8 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         title: notifTitle,
         body: notifBody,
         channelId: 'chat',
-        // Sans annonce : conversation support (le web ne connaît pas « inbox »).
         url: `/messages/${record.listing_id || 'support'}/${record.sender_id}`,
         tag: `chat-${record.sender_id}`,
-        // Pas d'image géante BigPicture au dépliage pour le chat (reste fluide et propre)
         image: null,
         badgeCount: unreadCount,
         chatPartnerId: record.sender_id,
@@ -292,6 +272,8 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
         } catch (_) { /* non-bloquant */ }
       }
       const forItem = itemTitle ? `\n📌 ${itemTitle}` : '';
+      const isSellerUnavailable = record.cancel_reason === 'unavailable' || record.cancel_reason === 'seller_unavailable';
+      const isAdminRefund = String(record.cancel_reason || '').startsWith('admin_refund');
 
       if (record.buyer_id) {
         let buyerTitle = '📦 Commande mise à jour';
@@ -306,10 +288,11 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
           buyerTitle = '🎉 Colis livré !';
           buyerMsg = `Votre commande ${ref} a été remise en mains propres.${forItem}\nMerci pour votre confiance ❤️`;
         } else if (status === 'cancelled') {
-          buyerTitle = '❌ Commande annulée';
-          buyerMsg = record.payment_method === 'online'
-            ? `Votre commande ${ref} a été annulée.${forItem}\nLe remboursement Mobile Money est en cours.`
-            : `Votre commande ${ref} a été annulée.${forItem}`;
+          buyerTitle = isSellerUnavailable ? '❌ Article indisponible' : isAdminRefund ? '⚖️ Litige réglé' : '❌ Commande annulée';
+          const refundText = record.payment_method === 'online' ? '\nLe remboursement Mobile Money est en cours.' : '';
+          buyerMsg = isSellerUnavailable
+            ? `Le vendeur ne peut pas honorer la commande ${ref}.${forItem}${refundText}`
+            : `Votre commande ${ref} a été annulée.${forItem}${refundText}`;
         } else if (status === 'disputed') {
           buyerTitle = '⚠️ Litige ouvert';
           buyerMsg = `Un litige a été ouvert sur la commande ${ref}.${forItem}\nNotre équipe intervient.`;
@@ -337,6 +320,14 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
           sellerMsg = record.payment_method === 'online'
             ? `Le colis ${ref} a été remis au client.${forItem}\nVotre virement Mobile Money est programmé.`
             : `Le colis ${ref} a été remis au client.${forItem}\nLa commande est clôturée.`;
+        } else if (status === 'cancelled' && !isSellerUnavailable) {
+          sellerTitle = isAdminRefund ? '⚖️ Litige réglé' : '❌ Commande annulée par le client';
+          sellerMsg = isAdminRefund
+            ? `Le litige sur la commande ${ref} a été arbitré.${forItem}`
+            : `L'acheteur a annulé la commande ${ref} avant expédition.${forItem}\nL'article a été remis en stock.`;
+        } else if (status === 'disputed') {
+          sellerTitle = '⚠️ Litige ouvert sur une vente';
+          sellerMsg = `Un incident a été signalé sur la commande ${ref}.${forItem}\nL'équipe DaloaMarket examine le dossier.`;
         }
 
         if (sellerMsg) {
@@ -344,7 +335,7 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             title: sellerTitle,
             body: sellerMsg,
             channelId: 'orders',
-            url: '/mes-commandes',
+            url: `/suivi/${record.id}`,
             tag: `order-seller-${record.id}`,
             image: itemPhoto,
             orderId: record.id,
@@ -360,8 +351,6 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
       const status = record.status;
       const oldStatus = old_record?.status;
       const priceText = record.delivery_price ? formatFCFA(record.delivery_price) : 'Rémunérée';
-      // Lien ouvert par le site livreur (/course/:id). L'app livreur, elle,
-      // route sur le `tag` (delivery-assign-<id> / delivery-open-<id>).
       const courseUrl = `/course/${record.id}`;
 
       if (type === 'INSERT' || (type === 'UPDATE' && status === 'awaiting_pickup' && oldStatus !== 'awaiting_pickup')) {
@@ -376,9 +365,6 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             }, { appType: 'delivery' });
           }
         } else {
-          // Course privée (paiement espèces) : elle est réservée aux livreurs
-          // affiliés au vendeur. Elle ne notifiait personne du tout, alors
-          // qu'elle attend elle aussi un preneur.
           let drivers = null;
           if (record.is_private) {
             if (record.seller_id) {
@@ -387,15 +373,10 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
                 .select('delivery_persons!inner(user_id, is_available)')
                 .eq('seller_id', record.seller_id)
                 .eq('status', 'active');
-              drivers = (affiliated || [])
-                .map((a) => a.delivery_persons)
-                .filter((dp) => dp && dp.is_available);
+              drivers = (affiliated || []).map((a) => a.delivery_persons).filter((dp) => dp && dp.is_available);
             }
           } else {
-            const { data: available } = await supabase
-              .from('delivery_persons')
-              .select('user_id')
-              .eq('is_available', true);
+            const { data: available } = await supabase.from('delivery_persons').select('user_id').eq('is_available', true);
             drivers = available;
           }
 
@@ -412,13 +393,19 @@ router.post('/push/webhook', requireWebhookSecret(ENV.PUSH_WEBHOOK_SECRET, 'x-pu
             }
           }
         }
+      } else if (type === 'UPDATE' && (status === 'cancelled' || status === 'disputed') && oldStatus !== status && record.delivery_person_id) {
+        const { data: dp } = await supabase.from('delivery_persons').select('user_id').eq('id', record.delivery_person_id).maybeSingle();
+        if (dp?.user_id) {
+          await sendPushToUser(dp.user_id, {
+            title: status === 'cancelled' ? '❌ Course annulée' : '⚠️ Course en litige',
+            body: status === 'cancelled'
+              ? 'La commande associée a été annulée avant le ramassage. Ne vous déplacez plus.'
+              : 'Un incident a été signalé sur cette course. L’équipe DaloaMarket examine le dossier.',
+            url: courseUrl,
+            tag: `delivery-assign-${record.id}`,
+          }, { appType: 'delivery' });
+        }
       }
-
-      // Prise en charge et livraison : l'acheteur et le vendeur sont déjà
-      // prévenus par le changement de `orders.status` (branche 2), que
-      // verify_pickup et verify_delivery font en même temps. Les notifier ici
-      // aussi leur envoyait chaque message en double — dont un « Colis
-      // arrivé, donnez votre code » envoyé APRÈS la saisie du code.
 
       return res.json({ ok: true });
     }
