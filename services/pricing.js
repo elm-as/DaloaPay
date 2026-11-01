@@ -65,7 +65,7 @@ function calculateDeliveryFee(distanceKm) {
     km > PRICING.DELIVERY_FREE_KM
       ? Math.round((km - PRICING.DELIVERY_FREE_KM) * PRICING.DELIVERY_RATE_PER_KM)
       : 0;
-  return PRICING.DELIVERY_MIN + extra;
+  return Math.round((PRICING.DELIVERY_MIN + extra) / 50) * 50;
 }
 
 /**
