@@ -97,6 +97,7 @@ app.use('/', require('./routes/payment-webhook'));
 app.use('/', require('./routes/payouts'));
 app.use('/', require('./routes/notifications'));
 app.use('/', require('./routes/channels'));
+app.use('/', require('./routes/admin-orders'));
 
 // 6. Gestionnaire d'erreurs global
 app.use((err, req, res, next) => {
