@@ -30,13 +30,7 @@ const DISTANCE_RULE = {
 const DALOA_CENTER = { lat: 6.8773, lng: -6.4502 };
 const GEOFENCE_RADIUS_KM = 10;
 
-const MAPBOX_TOKEN =
-  process.env.MAPBOX_TOKEN ||
-  process.env.VITE_MAPBOX_TOKEN ||
-  Buffer.from(
-    'cGsuZXlKMUlqb2laV3h0WVhOa1pYWWlMQ0poSWpvaVkyMTBiSFo2ZGpOMU1EQnllakozYzJod01qazJjbnA1TmlKOS5wM1BjUVN4azExMWpiSHN0Zm1EYzZB',
-    'base64'
-  ).toString('utf8');
+const MAPBOX_TOKEN = (process.env.MAPBOX_TOKEN || process.env.VITE_MAPBOX_TOKEN || '').trim();
 
 function haversineDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;

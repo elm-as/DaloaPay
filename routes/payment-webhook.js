@@ -71,8 +71,14 @@ async function handleMoneyFusionWebhook(req, res, personal) {
  * Rejet des horodatages > 5 minutes (300 secondes) pour parer aux attaques par rejeu.
  */
 function verifySasPaySignature(req) {
-  const secretConfig = ENV.SASPAY_WEBHOOK_SECRET;
-  if (!secretConfig) return { valid: true };
+const secretConfig = (ENV.SASPAY_WEBHOOK_SECRET || '').trim();
+  if (!secretConfig) {
+    if (process.env.NODE_ENV === 'production') {
+      return { valid: false, reason: 'SASPAY_WEBHOOK_SECRET non configuré sur le serveur de production' };
+    }
+    console.warn('[SasPay Webhook]: SASPAY_WEBHOOK_SECRET non configuré en dev — fallback getCheckoutSession');
+    return { valid: true, unsignedFallback: true };
+  }
 
   const signature = req.get('x-webhook-signature') || req.get('x-saspay-signature');
   const timestampHeader = req.get('x-webhook-timestamp') || req.get('x-saspay-timestamp');
