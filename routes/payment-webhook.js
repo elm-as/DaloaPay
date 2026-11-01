@@ -98,8 +98,9 @@ function verifySasPaySignature(req) {
   const secretConfig = (ENV.SASPAY_WEBHOOK_SECRET || '').trim();
   if (!secretConfig) {
     if (process.env.NODE_ENV === 'production') {
-      console.warn('[SasPay Webhook]: SASPAY_WEBHOOK_SECRET non configuré — vérification serveur getCheckoutSession stricte exigée.');
+      return { valid: false, reason: 'SASPAY_WEBHOOK_SECRET non configuré sur le serveur de production' };
     }
+    console.warn('[SasPay Webhook]: SASPAY_WEBHOOK_SECRET non configuré en dev — fallback getCheckoutSession');
     return { valid: true, unsignedFallback: true };
   }
 
