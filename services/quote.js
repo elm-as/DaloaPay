@@ -144,7 +144,8 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
       sellers.set(listing.user_id, seller);
     }
 
-    const buyerFee = Math.round(productAmount * PRICING.BUYER_FEE_RATE);
+    const isCashOrder = isPickupMode || oi?.payment_method === 'cod' || oi?.payment_method === 'cash_at_shop';
+    const buyerFee = isCashOrder ? 0 : Math.round(productAmount * PRICING.BUYER_FEE_RATE);
     const sellerCommission = Math.round(productAmount * sellerFeeRate);
     seller.buyer_fee += buyerFee;
     seller.product_amount += productAmount;
