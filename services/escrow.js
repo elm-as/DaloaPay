@@ -191,6 +191,28 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       }
     }
 
+    let pickupLocation = 'Boutique du vendeur';
+    if (sellerId) {
+      try {
+        const { data: sellerData } = await supabase
+          .from('users')
+          .select('shop_name, district, full_name')
+          .eq('id', sellerId)
+          .maybeSingle();
+        if (sellerData) {
+          const shop = sellerData.shop_name || sellerData.full_name || 'Boutique';
+          pickupLocation = sellerData.district ? `Quartier ${sellerData.district} — ${shop}` : shop;
+        }
+      } catch (err) {
+        console.warn('[escrow] Erreur résolution boutique vendeur:', err);
+      }
+    }
+
+    let dropoffLocation = address || 'Retrait en boutique';
+    if (!isPickup && meta?.delivery_district && !dropoffLocation.toLowerCase().includes(meta.delivery_district.toLowerCase())) {
+      dropoffLocation = `Quartier ${meta.delivery_district} — ${dropoffLocation}`;
+    }
+
     const pickupOTP = generateOTP();
     const deliveryOTP = generateOTP();
     await supabase.from('delivery_assignments').insert({
@@ -202,8 +224,8 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       delivery_otp: deliveryOTP,
       pickup_otp_attempts: 0,
       delivery_otp_attempts: 0,
-      pickup_location: 'Boutique du vendeur',
-      dropoff_location: address || 'Retrait en boutique',
+      pickup_location: pickupLocation,
+      dropoff_location: dropoffLocation,
       delivery_price: deliveryFee || 0,
       seller_id: sellerId,
       is_private: isPickup,
