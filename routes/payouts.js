@@ -248,7 +248,7 @@ router.post('/mark-payout-manual/:id', requireAdminUser, async (req, res) => {
       .update({
         status: 'paid',
         completed_at: new Date().toISOString(),
-        provider_token: `manual_advance:${adminId.slice(0, 8)}`,
+        provider_token: `manual_advance:${adminId.slice(0, 8)}:${payoutId.slice(0, 8)}`,
         failure_reason: null,
       })
       .eq('id', payoutId);
