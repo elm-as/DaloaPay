@@ -212,7 +212,7 @@ async function sendSasPayPayout(params) {
       ok: res.ok,
       status: res.status,
       id: data?.id || null,
-      message: data?.message || json?.message,
+      message: data?.message || json?.message || json?.error?.message || json?.detail,
       data,
     };
   } finally {
