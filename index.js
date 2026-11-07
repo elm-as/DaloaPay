@@ -111,4 +111,50 @@ console.log('FUSION_API_URL from env:', JSON.stringify(ENV.FUSION_API_URL));
 console.log('SUPABASE_URL from env:', JSON.stringify(ENV.SUPABASE_URL));
 app.listen(PORT, () => console.log(`Payment & Push API running on port ${PORT}`));
 
+// 8. Balayage automatique (toutes les 15 min) des courses acceptées mais non ramassées > 3h30 (210 min)
+const STALE_PICKUP_TIMEOUT_MS = 210 * 60 * 1000;
+async function sweepStaleAcceptedDeliveries() {
+  try {
+    const supabase = getSupabaseAdminClient();
+    if (!supabase) return;
+    const cutoffIso = new Date(Date.now() - STALE_PICKUP_TIMEOUT_MS).toISOString();
+    const { data: staleRows } = await supabase
+      .from('delivery_assignments')
+      .select('id, accepted_at, updated_at, created_at')
+      .eq('status', 'accepted');
+
+    if (!Array.isArray(staleRows) || staleRows.length === 0) return;
+
+    const expiredIds = staleRows
+      .filter((row) => {
+        const ts = row.accepted_at || row.updated_at || row.created_at;
+        return ts && new Date(ts).toISOString() <= cutoffIso;
+      })
+      .map((row) => row.id);
+
+    if (expiredIds.length === 0) return;
+
+    const { error } = await supabase
+      .from('delivery_assignments')
+      .update({
+        status: 'awaiting_pickup',
+        delivery_person_id: null,
+        accepted_at: null,
+        pickup_otp_attempts: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .in('id', expiredIds)
+      .eq('status', 'accepted');
+
+    if (!error) {
+      console.log(`[Delivery Timeout Sweep] ${expiredIds.length} course(s) remise(s) en ligne après 3h30 sans retrait.`);
+    }
+  } catch (err) {
+    console.warn('[Delivery Timeout Sweep] Erreur non-bloquante:', err.message);
+  }
+}
+
+setInterval(sweepStaleAcceptedDeliveries, 15 * 60 * 1000);
+setTimeout(sweepStaleAcceptedDeliveries, 10_000);
+
 module.exports = app;
