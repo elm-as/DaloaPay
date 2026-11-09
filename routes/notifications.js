@@ -3,6 +3,7 @@ const router = express.Router();
 const { ENV, getSupabaseAdminClient } = require('../config/env');
 const { requireAuthenticatedUser, requireAdminUser, requireAdminSecret, requireWebhookSecret } = require('../middlewares/auth');
 const { broadcastPush, sendPushToUser } = require('../services/push');
+const { VALID_SEGMENTS, executeSegmentedPushCampaign } = require('../services/push-campaigns');
 
 function firstPhoto(photos) {
   const first = Array.isArray(photos) ? photos[0] : null;
@@ -31,6 +32,46 @@ router.post('/push/broadcast', requireAdminUser, async (req, res) => {
     return res.json({ success: true, ...result });
   } catch (err) {
     console.error('[Push Broadcast Exception]:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/push/campaign', requireAdminUser, async (req, res) => {
+  try {
+    const { segment, title, body, url, dryRun } = req.body || {};
+    if (!title || !body) {
+      return res.status(400).json({ success: false, message: 'Titre et corps requis' });
+    }
+    if (!VALID_SEGMENTS.includes(segment)) {
+      return res.status(400).json({ success: false, message: 'Segment cible invalide (dormant | active_seller)' });
+    }
+
+    const result = await executeSegmentedPushCampaign({
+      segment,
+      title,
+      body,
+      url: url || '/',
+      dryRun: Boolean(dryRun),
+    });
+
+    if (!dryRun && result.sent > 0) {
+      try {
+        const supabase = getSupabaseAdminClient();
+        if (supabase) {
+          await supabase.from('notifications').insert({
+            title: `[${segment === 'dormant' ? 'Inactifs' : 'Vendeurs'}] ${title}`,
+            body,
+            url: url || null,
+          });
+        }
+      } catch (dbErr) {
+        console.warn('[Push Campaign] Supabase insert warning:', dbErr.message);
+      }
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('[Push Campaign Exception]:', err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
