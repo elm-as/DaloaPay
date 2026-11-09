@@ -93,10 +93,12 @@ async function fetchCampaignSegmentRecipients(supabase, segment) {
       .eq('is_active', true),
     supabase
       .from('listings')
-      .select('user_id, status'),
+      .select('user_id, status')
+      .neq('status', 'deleted'),
     supabase
       .from('orders')
-      .select('buyer_id'),
+      .select('buyer_id, status')
+      .neq('status', 'cancelled'),
   ]);
 
   if (subsRes.error) throw new Error(`Erreur lecture abonnements push: ${subsRes.error.message}`);
