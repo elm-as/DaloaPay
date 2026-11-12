@@ -3,7 +3,12 @@ const { sendPushToUser } = require('./push');
 
 const SUPPORT_WHATSAPP_NUMBER = '+225 07 04 16 33 61';
 const OFFICIAL_WHATSAPP_CHANNEL = 'https://whatsapp.com/channel/0029Vb94o2vJENy5kkADR42U';
-const VALID_SEGMENTS = ['dormant', 'active_seller'];
+const VALID_SEGMENTS = [
+  'dormant',
+  'active_seller',
+  'seller_no_promo',
+  'buyer_cancelled',
+];
 
 /**
  * Extrait le prénom ou nom d'affichage d'un utilisateur pour personnaliser sa notification.
@@ -93,12 +98,11 @@ async function fetchCampaignSegmentRecipients(supabase, segment) {
       .eq('is_active', true),
     supabase
       .from('listings')
-      .select('user_id, status')
+      .select('user_id, status, price, original_price')
       .neq('status', 'deleted'),
     supabase
       .from('orders')
-      .select('buyer_id, status')
-      .neq('status', 'cancelled'),
+      .select('buyer_id, status'),
   ]);
 
   if (subsRes.error) throw new Error(`Erreur lecture abonnements push: ${subsRes.error.message}`);
@@ -117,21 +121,38 @@ async function fetchCampaignSegmentRecipients(supabase, segment) {
 
   const usersWithAnyListing = new Set();
   const usersWithActiveListing = new Set();
+  const usersWithActivePromo = new Set();
   for (const row of listingsRes.data || []) {
     if (!row.user_id) continue;
     usersWithAnyListing.add(row.user_id);
     if (row.status === 'active') {
       usersWithActiveListing.add(row.user_id);
+      if (row.original_price != null && Number(row.original_price) > Number(row.price)) {
+        usersWithActivePromo.add(row.user_id);
+      }
     }
   }
 
-  const usersWithAnyOrder = new Set(
-    (ordersRes.data || []).map((o) => o.buyer_id).filter(Boolean)
-  );
+  const usersWithValidOrder = new Set();
+  const usersWithCancelledOrder = new Set();
+  for (const o of ordersRes.data || []) {
+    if (!o.buyer_id) continue;
+    if (o.status === 'cancelled') {
+      usersWithCancelledOrder.add(o.buyer_id);
+    } else {
+      usersWithValidOrder.add(o.buyer_id);
+    }
+  }
 
   const matchingUserIds = Array.from(subscribedMarketUserIds).filter((uid) => {
     if (segment === 'dormant') {
-      return !usersWithAnyListing.has(uid) && !usersWithAnyOrder.has(uid);
+      return !usersWithAnyListing.has(uid) && !usersWithValidOrder.has(uid);
+    }
+    if (segment === 'seller_no_promo') {
+      return usersWithActiveListing.has(uid) && !usersWithActivePromo.has(uid);
+    }
+    if (segment === 'buyer_cancelled') {
+      return usersWithCancelledOrder.has(uid) && !usersWithValidOrder.has(uid);
     }
     return usersWithActiveListing.has(uid);
   });
