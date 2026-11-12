@@ -98,6 +98,7 @@ app.use('/', require('./routes/payouts'));
 app.use('/', require('./routes/notifications'));
 app.use('/', require('./routes/channels'));
 app.use('/', require('./routes/admin-orders'));
+app.use('/', require('./routes/engagement'));
 
 // 6. Gestionnaire d'erreurs global
 app.use((err, req, res, next) => {
