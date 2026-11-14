@@ -13,12 +13,17 @@ const {
   markQuoteUsed,
 } = require('../services/quote');
 
-// Verrou en mémoire anti-clics concurrents (ex: double-tap rapide)
+// Verrou en mémoire borné anti-clics concurrents (ex: double-tap rapide)
 const inFlightRequests = new Map();
 
 function withInFlightLock(key, fn) {
+  const MAX_INFLIGHT_LOCKS = 500;
   if (inFlightRequests.has(key)) {
     return inFlightRequests.get(key);
+  }
+  if (inFlightRequests.size >= MAX_INFLIGHT_LOCKS) {
+    const oldestKey = inFlightRequests.keys().next().value;
+    if (oldestKey !== undefined) inFlightRequests.delete(oldestKey);
   }
   const promise = (async () => {
     try {
@@ -60,9 +65,15 @@ async function attachPaymentSession(supabase, { type, transactionId, token, paym
 
 // 1) Créer un paiement (Order Escrow ou Monétisation) — MoneyFusion ou SasPay
 router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, async (req, res) => {
-  console.log('POST /create-payment received', req.body);
   const userId = req.user.id;
   const lockKey = `${userId}:${req.body.type}:${req.body.quoteId || req.body.plan || req.body.amount || ''}`;
+
+  if (inFlightRequests.has(lockKey)) {
+    return res.status(409).json({
+      success: false,
+      message: 'Une création de paiement est déjà en cours de traitement pour cette commande. Veuillez patienter.',
+    });
+  }
 
   return withInFlightLock(lockKey, async () => {
     try {
@@ -114,10 +125,10 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       }
 
       const activeProvider = payConfig.provider || ENV.PAYMENT_PROVIDER || 'moneyfusion';
+
       let transactionId = '';
       let finalAmount = 0;
       let resolvedPlan = null;
-      const fifteenMinsAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
 
       if (type === 'order') {
         let metaItems;
@@ -146,40 +157,14 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
               });
             }
           }
+
+          if (quoteId) await markQuoteUsed(supabase, quoteId, 'online');
         } catch (err) {
           if (err instanceof QuoteError) {
             return res.status(err.status).json({ success: false, reason: err.reason, message: err.message });
           }
           throw err;
         }
-
-        // Réutilisation d'une session de commande en attente (évite les doublons)
-        if (!req.body.forceNew && quoteId) {
-          const { data: existingEscrow } = await supabase
-            .from('escrow_transactions')
-            .select('id, payment_reference, order_metadata')
-            .eq('buyer_id', userId)
-            .eq('status', 'pending')
-            .gte('created_at', fifteenMinsAgo)
-            .not('payment_reference', 'is', null)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-          if (existingEscrow && existingEscrow.order_metadata?.quote_id === quoteId && existingEscrow.order_metadata?.checkout_url) {
-            console.log(`[create-payment]: Réutilisation session commande ${existingEscrow.id} pour devis ${quoteId}`);
-            return res.json({
-              success: true,
-              transactionId: existingEscrow.id,
-              token: existingEscrow.payment_reference,
-              paymentUrl: existingEscrow.order_metadata.checkout_url,
-              payment_url: existingEscrow.order_metadata.checkout_url,
-              reused: true,
-            });
-          }
-        }
-
-        if (quoteId) await markQuoteUsed(supabase, quoteId, 'online');
 
         const { data: escrow, error: escrowErr } = await supabase
           .from('escrow_transactions')
@@ -215,33 +200,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
         finalAmount = price.amount;
         resolvedPlan = price.plan;
 
-        // Réutilisation d'une session de monétisation en attente (évite les doublons)
-        if (!req.body.forceNew) {
-          const { data: existingTx } = await supabase
-            .from('monetization_transactions')
-            .select('id, provider_token, amount, metadata')
-            .eq('user_id', userId)
-            .eq('type', type)
-            .eq('status', 'pending')
-            .gte('created_at', fifteenMinsAgo)
-            .not('provider_token', 'is', null)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-          if (existingTx && existingTx.metadata?.checkout_url && Number(existingTx.amount) === Number(finalAmount)) {
-            console.log(`[create-payment]: Réutilisation session monétisation ${existingTx.id} pour user ${userId}`);
-            return res.json({
-              success: true,
-              transactionId: existingTx.id,
-              token: existingTx.provider_token,
-              paymentUrl: existingTx.metadata.checkout_url,
-              payment_url: existingTx.metadata.checkout_url,
-              reused: true,
-            });
-          }
-        }
-
         const { data: tx, error: txErr } = await supabase
           .from('monetization_transactions')
           .insert({ user_id: userId, type, amount: finalAmount, status: 'pending' })
@@ -267,9 +225,7 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
 
       if (userId) {
         const { data: u } = await supabase.from('users').select('phone, full_name, email').eq('id', userId).maybeSingle();
-        if (!cleanPhone || cleanPhone === '0700000000') {
-          if (u?.phone) cleanPhone = normalizeCustomerPhone(u.phone);
-        }
+        if ((!cleanPhone || cleanPhone === '0700000000') && u?.phone) cleanPhone = normalizeCustomerPhone(u.phone);
         if (!resolvedName && u?.full_name) resolvedName = u.full_name.trim();
         if (u?.email) resolvedEmail = u.email.trim();
       }
@@ -282,7 +238,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
         credits_pack_30: 'Pack Or (30 crédits de boost)',
       };
 
-      // BRANCH 1 : Prestataire SasPay
       if (activeProvider === 'saspay') {
         if (!resolvedEmail) resolvedEmail = `client_${userId.slice(0, 8)}@daloamarket.com`;
         const saspayRes = await createCheckoutSession({
@@ -309,7 +264,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
         return res.json(attached);
       }
 
-      // BRANCH 2 : Prestataire MoneyFusion (par défaut)
       const fusionPayload = {
         totalPrice: Math.round(finalAmount),
         article: [{ [labelByType[type] || type]: Math.round(finalAmount) }],

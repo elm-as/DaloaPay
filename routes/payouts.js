@@ -2,10 +2,9 @@ const express = require('express');
 const router = express.Router();
 const { ENV, checkConfig, getSupabaseAdminClient, secretMatches } = require('../config/env');
 const { payoutLimiter } = require('../config/rate-limiters');
-const { allowSecretOrAuthenticatedUser, requireAdminUser, requireWebhookSecret } = require('../middlewares/auth');
+const { allowSecretOrAuthenticatedUser, requireAdminUser } = require('../middlewares/auth');
 const { sendWithdraw } = require('../services/moneyfusion');
 const { sendSasPayPayout } = require('../services/saspay');
-const { sendPushToUser } = require('../services/push');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -14,15 +13,27 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  */
 function resolveWithdrawMode(phone, currentMode) {
   if (currentMode) return currentMode;
-  const clean = String(phone || '').replace(/\s+/g, '').replace(/^\+225/, '');
+  let clean = String(phone || '').replace(/\s+/g, '');
+  if (clean.startsWith('+225')) clean = clean.slice(4);
+  else if (clean.startsWith('00225')) clean = clean.slice(5);
+  else if (clean.startsWith('225')) clean = clean.slice(3);
   if (clean.startsWith('01')) return 'moov-ci';
   if (clean.startsWith('05')) return 'mtn-ci';
   if (clean.startsWith('07')) return 'wave-ci';
   return null;
 }
 
-// 3) Traitement des Payouts (MoneyFusion ou SasPay selon configuration)
-router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, async (req, res) => {
+// Rejet strict des requêtes GET sur /process-payouts (R3)
+router.get('/process-payouts', (req, res) => {
+  res.set('Allow', 'POST');
+  return res.status(405).json({
+    success: false,
+    message: 'Méthode non autorisée. La route /process-payouts exige une requête HTTP POST.',
+  });
+});
+
+// 3) Traitement des Payouts (POST uniquement)
+router.post('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, async (req, res) => {
   try {
     checkConfig();
     const supabase = getSupabaseAdminClient();
@@ -173,7 +184,9 @@ router.get('/process-payouts', allowSecretOrAuthenticatedUser, payoutLimiter, as
           target_id: 'payouts_cron_queue',
           amount: totalAmount,
           details: {
+            provider: forcedProvider || defaultProvider,
             forced_provider: forcedProvider,
+            default_provider: defaultProvider,
             processed_count: payouts.length,
             retry_failed: req.query.retry_failed === 'true',
             forced: force,
@@ -214,12 +227,17 @@ router.post('/retry-payout/:id', allowSecretOrAuthenticatedUser, payoutLimiter, 
     }
 
     const payoutId = req.params.id;
-    const { error: resetErr } = await supabase
+    const { data: updatedRows, error: resetErr } = await supabase
       .from('payouts')
       .update({ status: 'pending', failure_reason: null })
-      .eq('id', payoutId);
+      .eq('id', payoutId)
+      .eq('status', 'failed')
+      .select('id');
 
     if (resetErr) throw resetErr;
+    if (!updatedRows || updatedRows.length === 0) {
+      return res.status(409).json({ success: false, message: 'Seuls les versements en échec peuvent être relancés.' });
+    }
 
     return res.json({ success: true, message: 'Versement réinitialisé en attente avec succès.' });
   } catch (e) {
@@ -241,6 +259,10 @@ router.post('/mark-payout-manual/:id', requireAdminUser, async (req, res) => {
     const { data: payout, error: getErr } = await supabase.from('payouts').select('*').eq('id', payoutId).maybeSingle();
     if (getErr || !payout) {
       return res.status(404).json({ success: false, message: 'Versement introuvable' });
+    }
+
+    if (payout.status === 'paid') {
+      return res.status(409).json({ success: false, message: 'Ce versement a déjà été payé.' });
     }
 
     const { error: updateErr } = await supabase
@@ -267,7 +289,7 @@ router.post('/mark-payout-manual/:id', requireAdminUser, async (req, res) => {
           recipient_type: payout.type,
           escrow_id: payout.escrow_id,
           payment_method: paymentMethod || 'manual_wave',
-          note: note || 'Avancé sur fonds propres administrateur (prestataire indisponible)',
+          note: note || 'Avancé sur fonds propres administrateur',
         },
       });
     } catch (logErr) {
@@ -277,67 +299,6 @@ router.post('/mark-payout-manual/:id', requireAdminUser, async (req, res) => {
     return res.json({ success: true, message: 'Versement marqué comme payé manuellement avec succès.' });
   } catch (e) {
     return res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// 4) Webhook pour le résultat des Payouts (MoneyFusion & SasPay)
-router.post('/payout-webhook', requireWebhookSecret(ENV.PAYOUT_WEBHOOK_SECRET, 'x-payout-webhook-secret'), async (req, res) => {
-  console.log('[Webhook Payout Received] Payload:', JSON.stringify(req.body));
-  try {
-    checkConfig();
-    const { event, tokenPay, message, id } = req.body;
-    const refToken = tokenPay || id;
-
-    if (!refToken) {
-      return res.status(400).json({ ok: false, message: 'Token absent' });
-    }
-
-    const supabase = getSupabaseAdminClient();
-    if (!supabase) return res.status(503).json({ ok: false, message: 'DB indisponible' });
-
-    const isSuccess = event === 'payout.session.completed' || event === 'payout.success';
-    const isCancelled = event === 'payout.session.cancelled' || event === 'payout.failed';
-
-    if (isSuccess) {
-      const { data: updated } = await supabase
-        .from('payouts')
-        .update({ status: 'paid', completed_at: new Date().toISOString() })
-        .eq('provider_token', refToken)
-        .select('id, recipient_id, recipient_type, net_amount')
-        .maybeSingle();
-      if (updated?.recipient_id) {
-        const isDriver = updated.recipient_type === 'delivery';
-        const amt = Number(updated.net_amount || 0).toLocaleString('fr-FR');
-        sendPushToUser(updated.recipient_id, {
-          title: '💸 Versement Mobile Money envoyé !',
-          body: `Votre virement de ${amt} FCFA a été crédité sur votre compte Mobile Money.`,
-          url: isDriver ? '/earnings' : '/mes-paiements',
-          tag: `payout-${updated.id}`,
-        }, { appType: isDriver ? 'delivery' : 'market' }).catch(() => {});
-      }
-    } else if (isCancelled) {
-      const { data: updated } = await supabase
-        .from('payouts')
-        .update({ status: 'failed', failure_reason: message || 'Annulé par passerelle de paiement' })
-        .eq('provider_token', refToken)
-        .select('id, recipient_id, recipient_type, net_amount')
-        .maybeSingle();
-      if (updated?.recipient_id) {
-        const isDriver = updated.recipient_type === 'delivery';
-        const amt = Number(updated.net_amount || 0).toLocaleString('fr-FR');
-        sendPushToUser(updated.recipient_id, {
-          title: '⚠️ Échec du versement Mobile Money',
-          body: `Le virement de ${amt} FCFA n'a pas abouti. Vérifiez votre numéro de retrait.`,
-          url: isDriver ? '/payout-setup' : '/settings/payout',
-          tag: `payout-${updated.id}`,
-        }, { appType: isDriver ? 'delivery' : 'market' }).catch(() => {});
-      }
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('[Webhook Payout Exception]:', e);
-    return res.status(500).json({ ok: false, message: e.message });
   }
 });
 

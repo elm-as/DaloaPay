@@ -17,10 +17,8 @@ const cors = require('cors');
 const { globalLimiter } = require('./config/rate-limiters');
 const { createIpBanMiddleware } = require('./ipBanMiddleware');
 
-// SEO Prerender helpers
-const { isBot } = require('./seo/botDetector');
-const { renderCategoryPage } = require('./seo/marketPrerender');
-const { renderDriverProfile } = require('./seo/deliveryPrerender');
+// SEO Prerender middleware
+const { seoPrerenderMiddleware } = require('./seo/prerenderMiddleware');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -41,53 +39,7 @@ app.use(express.json({
 app.use(createIpBanMiddleware(getSupabaseAdminClient()));
 
 // 4. Interception pour les robots SEO (Googlebot, WhatsApp, Facebook...)
-app.use(async (req, res, next) => {
-  const ua = req.get('user-agent') || '';
-  const isBotDetected = isBot(ua);
-
-  if (!isBotDetected) return next();
-
-  try {
-    const supabase = getSupabaseAdminClient();
-    if (!supabase) return next();
-
-    const path = req.path;
-
-    // A. DaloaDelivery : Profil Livreur (/livreur/:id)
-    if (path.startsWith('/livreur/')) {
-      const driverId = path.split('/')[2];
-      if (driverId) {
-        const html = await renderDriverProfile(supabase, driverId);
-        return res.send(html);
-      }
-    }
-
-    // B. DaloaMarket : Catégorie (/c/:slug, /categorie/:slug ou /mode, /electronique...)
-    let categorySlug = null;
-    if (path.startsWith('/c/')) {
-      categorySlug = path.split('/')[2];
-    } else if (path.startsWith('/categorie/')) {
-      categorySlug = path.split('/')[2];
-    } else {
-      const catRoutes = ['electronique', 'vehicules', 'mode', 'cosmetiques', 'maison-deco', 'sports-loisirs', 'livres', 'alimentaire'];
-      const rawSlug = path.replace(/^\//, '').toLowerCase();
-      if (catRoutes.includes(rawSlug)) {
-        categorySlug = rawSlug;
-      } else if (req.query.category) {
-        categorySlug = req.query.category;
-      }
-    }
-
-    if (categorySlug) {
-      const html = await renderCategoryPage(supabase, categorySlug);
-      return res.send(html);
-    }
-  } catch (err) {
-    console.error('[SEO Bot Prerender Error]:', err);
-  }
-
-  next();
-});
+app.use(seoPrerenderMiddleware);
 
 // 5. Montage des routeurs par domaine
 app.use('/', require('./routes/health'));
@@ -96,9 +48,12 @@ app.use('/', require('./routes/payments'));
 app.use('/', require('./routes/payment-status'));
 app.use('/', require('./routes/payment-webhook'));
 app.use('/', require('./routes/payouts'));
+app.use('/', require('./routes/payout-webhook'));
 app.use('/', require('./routes/notifications'));
+app.use('/', require('./routes/notifications-webhook'));
 app.use('/', require('./routes/channels'));
 app.use('/', require('./routes/admin-orders'));
+app.use('/', require('./routes/admin-analytics'));
 app.use('/', require('./routes/engagement'));
 
 // 6. Gestionnaire d'erreurs global

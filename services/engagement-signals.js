@@ -1,8 +1,23 @@
 const { ENV, getSupabaseAdminClient } = require('../config/env');
 
 const CACHE_TTL_MS = 30 * 1000;
-let cachedListingSignals = new Map();
+const MAX_LISTING_SIGNALS_CACHE = 1000;
+const cachedListingSignals = new Map();
 let cachedMarketplaceStats = { data: null, expiresAt: 0 };
+
+function setCachedListingSignal(listingId, entry) {
+  if (cachedListingSignals.size >= MAX_LISTING_SIGNALS_CACHE) {
+    const now = Date.now();
+    for (const [key, value] of cachedListingSignals) {
+      if (value.expiresAt <= now) cachedListingSignals.delete(key);
+    }
+    if (cachedListingSignals.size >= MAX_LISTING_SIGNALS_CACHE) {
+      const oldestKey = cachedListingSignals.keys().next().value;
+      if (oldestKey !== undefined) cachedListingSignals.delete(oldestKey);
+    }
+  }
+  cachedListingSignals.set(listingId, entry);
+}
 
 /**
  * Récupère les signaux réels d'engagement pour une annonce (visiteurs uniques 7j, favoris, stock, réduction).
@@ -68,7 +83,7 @@ async function fetchListingEngagementSignals(listingId) {
     priceDropAmount,
   };
 
-  cachedListingSignals.set(listingId, { data, expiresAt: now + CACHE_TTL_MS });
+  setCachedListingSignal(listingId, { data, expiresAt: now + CACHE_TTL_MS });
   return data;
 }
 

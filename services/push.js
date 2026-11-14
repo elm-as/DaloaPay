@@ -1,5 +1,12 @@
 const webpush = require('web-push');
 const { ENV, getSupabaseAdminClient } = require('../config/env');
+const { DEFAULT_PUSH_CONCURRENCY, runWithConcurrency } = require('./push-dispatch-batch');
+const { hasTemplateVariables, renderPayloadForUser } = require('./push-template');
+const {
+  deduplicateBroadcastSubscriptions,
+  fetchBroadcastProfilesMap,
+  buildBroadcastDryRunPreview,
+} = require('./push-broadcast-helpers');
 
 const VAPID_CONFIGURED = Boolean(ENV.VAPID_PUBLIC_KEY && ENV.VAPID_PRIVATE_KEY);
 
@@ -95,8 +102,8 @@ async function sendExpoPush(expoPushToken, payload) {
             .eq('expo_push_token', expoPushToken);
           console.log(`[ExpoPush] Désactivation token expiré (DeviceNotRegistered): ${expoPushToken.slice(0, 30)}...`);
         }
-      } catch (_) {
-        /* non-bloquant */
+      } catch (deactivateErr) {
+        console.warn('[ExpoPush] Impossible de désactiver le token expiré:', deactivateErr.message);
       }
     }
 
@@ -238,7 +245,24 @@ async function sendPushToUser(userId, payload, options = {}) {
       }
     }
 
-    const results = await Promise.allSettled(uniqueSubs.map((sub) => dispatchPush(sub, payload)));
+    let resolvedPayload = payload;
+    if (hasTemplateVariables(payload)) {
+      const { data: userProfile, error: userErr } = await supabase
+        .from('users')
+        .select('id, full_name, shop_name, shop_slug')
+        .eq('id', userId)
+        .maybeSingle();
+      if (userErr) {
+        console.warn(`[Push] Profil indisponible pour variables user ${userId}:`, userErr.message);
+      }
+      resolvedPayload = renderPayloadForUser(payload, userProfile || { id: userId });
+    }
+
+    const results = await runWithConcurrency(
+      uniqueSubs,
+      (sub) => dispatchPush(sub, resolvedPayload),
+      DEFAULT_PUSH_CONCURRENCY
+    );
     const sentCount = results.filter((r) => r.status === 'fulfilled' && r.value?.success).length;
     return { success: true, sent: sentCount, total: uniqueSubs.length };
   } catch (err) {
@@ -250,8 +274,8 @@ async function sendPushToUser(userId, payload, options = {}) {
 /**
  * @param {object} [options]
  * @param {'market'|'delivery'} [options.appType] Limite la diffusion aux
- *   abonnés d'une application. L'admin proposait un choix d'audience qui
- *   n'était jamais transmis : tout partait à tout le monde.
+ *   abonnés d'une application.
+ * @param {boolean} [options.dryRun] Retourne uniquement le comptage et 3 aperçus.
  */
 async function broadcastPush(payload, options = {}) {
   try {
@@ -266,37 +290,38 @@ async function broadcastPush(payload, options = {}) {
     const { data: subs, error } = await query.order('updated_at', { ascending: false });
 
     if (error || !subs || subs.length === 0) {
-      return { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
+      return options.dryRun
+        ? { success: true, dryRun: true, recipientsCount: 0, devicesCount: 0, sent: 0, samples: [] }
+        : { success: true, sent: 0, message: 'Aucun abonnement push actif trouvé' };
     }
 
-    const usersWithExpo = new Set();
-    const expoSubsByUserApp = new Map();
-    for (const sub of subs) {
-      if (sub.expo_push_token) {
-        const key = `${sub.user_id}_${sub.app_type || 'market'}`;
-        if (!expoSubsByUserApp.has(key)) {
-          expoSubsByUserApp.set(key, sub);
-          usersWithExpo.add(sub.user_id);
-        }
-      }
+    const uniqueSubs = deduplicateBroadcastSubscriptions(subs);
+    const needsPersonalization = hasTemplateVariables(payload);
+
+    let userMap = new Map();
+    let activeSubs = uniqueSubs;
+    if (needsPersonalization || options.dryRun) {
+      const profiles = await fetchBroadcastProfilesMap(supabase, uniqueSubs);
+      userMap = profiles.userMap;
+      activeSubs = uniqueSubs.filter((s) => !profiles.excludedUserIds.has(s.user_id));
     }
 
-    const uniqueSubs = Array.from(expoSubsByUserApp.values());
-    const seenEndpoints = new Set();
-    for (const sub of subs) {
-      if (sub.endpoint && !seenEndpoints.has(sub.endpoint)) {
-        seenEndpoints.add(sub.endpoint);
-        const isMobileWeb = sub.user_agent && (sub.user_agent.includes('Android') || sub.user_agent.includes('Mobile'));
-        if (usersWithExpo.has(sub.user_id) && isMobileWeb) {
-          continue;
-        }
-        uniqueSubs.push(sub);
-      }
+    if (options.dryRun) {
+      return buildBroadcastDryRunPreview(activeSubs, userMap, payload);
     }
 
-    const results = await Promise.allSettled(uniqueSubs.map((sub) => dispatchPush(sub, payload)));
+    const results = await runWithConcurrency(
+      activeSubs,
+      (sub) => {
+        const subPayload = needsPersonalization
+          ? renderPayloadForUser(payload, userMap.get(sub.user_id) || { id: sub.user_id })
+          : payload;
+        return dispatchPush(sub, subPayload);
+      },
+      DEFAULT_PUSH_CONCURRENCY
+    );
     const sentCount = results.filter((r) => r.status === 'fulfilled' && r.value?.success).length;
-    return { success: true, sent: sentCount, total: uniqueSubs.length };
+    return { success: true, sent: sentCount, total: activeSubs.length };
   } catch (err) {
     console.error('[Push] broadcastPush failed:', err);
     return { success: false, error: err.message };

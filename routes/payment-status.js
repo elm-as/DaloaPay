@@ -18,7 +18,125 @@ const STATUS_MAP = {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Vérifier le statut d'un paiement (MoneyFusion & SasPay transparent)
+async function findTransaction(supabase, { table, refColumn, transactionId }) {
+  if (UUID_RE.test(transactionId)) {
+    const { data: byId } = await supabase.from(table).select('*').eq('id', transactionId).maybeSingle();
+    if (byId) return byId;
+  }
+  const { data: byRef } = await supabase.from(table).select('*').eq(refColumn, transactionId).maybeSingle();
+  return byRef || null;
+}
+
+async function resolveProviderOutcome(token, expectedAmount) {
+  const isSasPay = UUID_RE.test(token);
+  if (isSasPay) {
+    const session = await getCheckoutSession(token);
+    const isPaid = Boolean(session && ['PAID', 'SUCCESS'].includes(session.status || session.transaction_status));
+    const isFailure = Boolean(session && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(session.status));
+    return { provider: 'saspay', isPaid, isFailure };
+  }
+
+  const fusionData = await checkPaymentNotification(token);
+  const isPaidRaw = Boolean(fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid');
+  if (isPaidRaw && isUnderpaid(fusionData, expectedAmount)) {
+    return { provider: 'moneyfusion', isPaid: false, isFailure: false };
+  }
+  const isFailure = Boolean(fusionData && fusionData.data?.statut === 'failure');
+  return { provider: 'moneyfusion', isPaid: isPaidRaw, isFailure };
+}
+
+async function buildEscrowStatusResponse(supabase, escrow) {
+  if (escrow.status !== 'pending') {
+    return {
+      success: true,
+      status: STATUS_MAP[escrow.status] || 'unknown',
+      transactionId: escrow.id,
+      order_id: escrow.order_id || null,
+      amount: escrow.total_amount,
+      paymentMethod: escrow.payment_method,
+      confirmedAt: escrow.funded_at,
+    };
+  }
+
+  if (!escrow.payment_reference) {
+    return {
+      success: true,
+      status: 'pending',
+      transactionId: escrow.id,
+      amount: escrow.total_amount,
+      paymentMethod: escrow.payment_method,
+    };
+  }
+
+  try {
+    const outcome = await resolveProviderOutcome(escrow.payment_reference, escrow.total_amount);
+    if (outcome.isPaid) {
+      const orderId = await createOrderFromEscrow(supabase, escrow, null);
+      return {
+        success: true,
+        status: 'paid',
+        transactionId: escrow.id,
+        order_id: orderId,
+        amount: escrow.total_amount,
+        paymentMethod: outcome.provider === 'saspay' ? 'mobile_money' : escrow.payment_method,
+        confirmedAt: new Date().toISOString(),
+      };
+    }
+    if (outcome.isFailure) {
+      await supabase.from('escrow_transactions').update({ status: 'cancelled' }).eq('id', escrow.id);
+      return { success: true, status: 'failure', transactionId: escrow.id };
+    }
+  } catch (providerErr) {
+    console.warn('[check-payment] Escrow verification warning:', providerErr.message);
+  }
+
+  return {
+    success: true,
+    status: 'pending',
+    transactionId: escrow.id,
+    amount: escrow.total_amount,
+    paymentMethod: escrow.payment_method,
+  };
+}
+
+async function buildMonetizationStatusResponse(supabase, tx) {
+  if (tx.status !== 'pending') {
+    return {
+      success: true,
+      status: STATUS_MAP[tx.status] || 'unknown',
+      transactionId: tx.id,
+      amount: tx.amount,
+      confirmedAt: tx.confirmed_at,
+    };
+  }
+
+  if (!tx.provider_token) {
+    return { success: true, status: tx.status, transactionId: tx.id, amount: tx.amount };
+  }
+
+  try {
+    const outcome = await resolveProviderOutcome(tx.provider_token, tx.amount);
+    if (outcome.isPaid) {
+      await confirmMonetizationOnce(supabase, tx);
+      return {
+        success: true,
+        status: 'paid',
+        transactionId: tx.id,
+        amount: tx.amount,
+        confirmedAt: new Date().toISOString(),
+      };
+    }
+    if (outcome.isFailure) {
+      await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', tx.id);
+      return { success: true, status: 'failure', transactionId: tx.id };
+    }
+  } catch (providerErr) {
+    console.warn('[check-payment] Monetization verification warning:', providerErr.message);
+  }
+
+  return { success: true, status: tx.status, transactionId: tx.id, amount: tx.amount };
+}
+
 router.get('/check-payment', checkPaymentLimiter, async (req, res) => {
   try {
     checkConfig();
@@ -30,187 +148,22 @@ router.get('/check-payment', checkPaymentLimiter, async (req, res) => {
       return res.status(400).json({ success: false, message: 'transactionId requis' });
     }
 
-    // 1. Chercher d'abord dans escrow_transactions
-    let { data: escrow } = await supabase
-      .from('escrow_transactions')
-      .select('*')
-      .eq('id', transactionId)
-      .maybeSingle();
-
-    if (!escrow) {
-      const { data: escrowByRef } = await supabase
-        .from('escrow_transactions')
-        .select('*')
-        .eq('payment_reference', transactionId)
-        .maybeSingle();
-      escrow = escrowByRef;
-    }
-
+    const escrow = await findTransaction(supabase, {
+      table: 'escrow_transactions',
+      refColumn: 'payment_reference',
+      transactionId,
+    });
     if (escrow) {
-      if (escrow.status !== 'pending') {
-        return res.json({
-          success: true,
-          status: STATUS_MAP[escrow.status] || 'unknown',
-          transactionId: escrow.id,
-          order_id: escrow.order_id || null,
-          amount: escrow.total_amount,
-          paymentMethod: escrow.payment_method,
-          confirmedAt: escrow.funded_at,
-        });
-      }
-
-      if (escrow.payment_reference) {
-        const token = escrow.payment_reference;
-        const isSasPay = UUID_RE.test(token);
-
-        if (isSasPay) {
-          // Vérification SasPay
-          try {
-            const session = await getCheckoutSession(token);
-            const isPaid = session && (session.status === 'PAID' || session.transaction_status === 'SUCCESS' || session.status === 'SUCCESS');
-            if (isPaid) {
-              console.log('check-payment: SasPay confirmed, creating order...');
-              const orderId = await createOrderFromEscrow(supabase, escrow, null);
-              return res.json({
-                success: true,
-                status: 'paid',
-                transactionId: escrow.id,
-                order_id: orderId,
-                amount: escrow.total_amount,
-                paymentMethod: 'mobile_money',
-                confirmedAt: new Date().toISOString(),
-              });
-            }
-            if (session && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(session.status)) {
-              await supabase.from('escrow_transactions').update({ status: 'cancelled' }).eq('id', escrow.id);
-              return res.json({ success: true, status: 'failure', transactionId: escrow.id });
-            }
-          } catch (sasErr) {
-            console.log('check-payment: SasPay check failed:', sasErr.message);
-          }
-        } else {
-          // Vérification MoneyFusion
-          try {
-            const fusionData = await checkPaymentNotification(token);
-            if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
-              if (isUnderpaid(fusionData, escrow.total_amount)) {
-                return res.json({ success: true, status: 'pending', transactionId: escrow.id, amount: escrow.total_amount });
-              }
-              console.log('check-payment: MoneyFusion confirmed, creating order...');
-              const orderId = await createOrderFromEscrow(supabase, escrow, null);
-              return res.json({
-                success: true,
-                status: 'paid',
-                transactionId: escrow.id,
-                order_id: orderId,
-                amount: escrow.total_amount,
-                paymentMethod: escrow.payment_method,
-                confirmedAt: new Date().toISOString(),
-              });
-            }
-            if (fusionData && fusionData.data?.statut === 'failure') {
-              await supabase.from('escrow_transactions').update({ status: 'cancelled' }).eq('id', escrow.id);
-              return res.json({ success: true, status: 'failure', transactionId: escrow.id });
-            }
-          } catch (fusionErr) {
-            console.log('check-payment: MoneyFusion check failed:', fusionErr.message);
-          }
-        }
-      }
-
-      return res.json({
-        success: true,
-        status: 'pending',
-        transactionId: escrow.id,
-        amount: escrow.total_amount,
-        paymentMethod: escrow.payment_method,
-      });
+      return res.json(await buildEscrowStatusResponse(supabase, escrow));
     }
 
-    // 2. Chercher dans monetization_transactions
-    let { data: tx } = await supabase
-      .from('monetization_transactions')
-      .select('*')
-      .eq('id', transactionId)
-      .maybeSingle();
-
-    if (!tx) {
-      const { data: txByRef } = await supabase
-        .from('monetization_transactions')
-        .select('*')
-        .eq('provider_token', transactionId)
-        .maybeSingle();
-      tx = txByRef;
-    }
-
+    const tx = await findTransaction(supabase, {
+      table: 'monetization_transactions',
+      refColumn: 'provider_token',
+      transactionId,
+    });
     if (tx) {
-      if (tx.status !== 'pending') {
-        return res.json({
-          success: true,
-          status: STATUS_MAP[tx.status] || 'unknown',
-          transactionId: tx.id,
-          amount: tx.amount,
-          confirmedAt: tx.confirmed_at,
-        });
-      }
-
-      if (tx.provider_token) {
-        const token = tx.provider_token;
-        const isSasPay = UUID_RE.test(token);
-
-        if (isSasPay) {
-          try {
-            const session = await getCheckoutSession(token);
-            const isPaid = session && (session.status === 'PAID' || session.transaction_status === 'SUCCESS' || session.status === 'SUCCESS');
-            if (isPaid) {
-              await confirmMonetizationOnce(supabase, tx);
-              return res.json({
-                success: true,
-                status: 'paid',
-                transactionId: tx.id,
-                amount: tx.amount,
-                confirmedAt: new Date().toISOString(),
-              });
-            }
-            if (session && ['FAILED', 'CANCELLED', 'EXPIRED'].includes(session.status)) {
-              await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', tx.id);
-              return res.json({ success: true, status: 'failure', transactionId: tx.id });
-            }
-          } catch (sasErr) {
-            console.log('check-payment: SasPay monetization check failed:', sasErr.message);
-          }
-        } else {
-          try {
-            const fusionData = await checkPaymentNotification(token);
-            if (fusionData && fusionData.statut === true && fusionData.data?.statut === 'paid') {
-              if (isUnderpaid(fusionData, tx.amount)) {
-                return res.json({ success: true, status: 'pending', transactionId: tx.id, amount: tx.amount });
-              }
-              await confirmMonetizationOnce(supabase, tx);
-              return res.json({
-                success: true,
-                status: 'paid',
-                transactionId: tx.id,
-                amount: tx.amount,
-                confirmedAt: new Date().toISOString(),
-              });
-            }
-            if (fusionData && fusionData.data?.statut === 'failure') {
-              await supabase.from('monetization_transactions').update({ status: 'failed' }).eq('id', tx.id);
-              return res.json({ success: true, status: 'failure', transactionId: tx.id });
-            }
-          } catch (fusionErr) {
-            console.log('check-payment: MoneyFusion check failed:', fusionErr.message);
-          }
-        }
-      }
-
-      return res.json({
-        success: true,
-        status: tx.status,
-        transactionId: tx.id,
-        amount: tx.amount,
-      });
+      return res.json(await buildMonetizationStatusResponse(supabase, tx));
     }
 
     return res.status(404).json({ success: false, message: 'Transaction introuvable', status: 'unknown' });

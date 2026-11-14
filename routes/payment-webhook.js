@@ -1,11 +1,37 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
-const { checkConfig, getSupabaseAdminClient, secretMatches, ENV } = require('../config/env');
+const { checkConfig, getSupabaseAdminClient, ENV } = require('../config/env');
 const { checkPaymentNotification } = require('../services/moneyfusion');
 const { getCheckoutSession, verifyTransaction } = require('../services/saspay');
 const { createOrderFromEscrow } = require('../services/escrow');
 const { isUnderpaid, paidGrossAmount, confirmMonetizationOnce } = require('../services/monetization');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Recherche sécurisée d'une transaction par ID UUID ou par jeton prestataire.
+ */
+async function findTransactionByIdOrToken(supabase, { table, tokenColumn, rawIdentifier } = {}) {
+  const cleanId = String(rawIdentifier || '').trim();
+  if (!cleanId || !table || !tokenColumn) return null;
+
+  if (UUID_RE.test(cleanId)) {
+    const { data: byId } = await supabase
+      .from(table)
+      .select('*')
+      .eq('id', cleanId)
+      .maybeSingle();
+    if (byId) return byId;
+  }
+
+  const { data: byToken } = await supabase
+    .from(table)
+    .select('*')
+    .eq(tokenColumn, cleanId)
+    .maybeSingle();
+  return byToken || null;
+}
 
 /**
  * Traitement des webhooks MoneyFusion
@@ -47,7 +73,6 @@ async function handleMoneyFusionWebhook(req, res, personal) {
 
   if (fusionStatus === 'paid') {
     if (isOrder) {
-      console.log('webhook: payment confirmed, creating order...');
       await createOrderFromEscrow(supabase, tx, personal);
     } else {
       await confirmMonetizationOnce(supabase, tx);
@@ -130,36 +155,27 @@ function matchesSignature(candidateSig, computedHash) {
     const sigBuf = Buffer.from(candidateSig, 'utf8');
     const hashBuf = Buffer.from(computedHash, 'utf8');
     return sigBuf.length === hashBuf.length && crypto.timingSafeEqual(sigBuf, hashBuf);
-  } catch {
+  } catch (err) {
+    console.warn('[HMAC Comparison Warn]:', err.message);
     return false;
   }
 }
 
 /**
- * Valide la signature HMAC-SHA256 envoyée par SasPay.
+ * Valide la signature HMAC-SHA256 envoyée par SasPay avec tolérance multi-format.
  */
 function verifySasPaySignature(req) {
   const secretConfig = (ENV.SASPAY_WEBHOOK_SECRET || '').trim();
   if (!secretConfig) {
     if (process.env.NODE_ENV === 'production') {
-      return { valid: false, reason: 'SASPAY_WEBHOOK_SECRET non configuré' };
+      return { valid: false, reason: 'SASPAY_WEBHOOK_SECRET non configuré sur le serveur de production' };
     }
-    console.warn('[SasPay Webhook]: SASPAY_WEBHOOK_SECRET non configuré en dev — fallback API SasPay');
+    console.warn('[SasPay Webhook]: SASPAY_WEBHOOK_SECRET non configuré en dev — fallback getCheckoutSession');
     return { valid: true, unsignedFallback: true };
   }
 
-  const sigHeader =
-    req.get('x-webhook-signature') ||
-    req.get('x-saspay-signature') ||
-    req.get('x-signature') ||
-    req.get('signature') ||
-    '';
-  const tsHeader =
-    req.get('x-webhook-timestamp') ||
-    req.get('x-saspay-timestamp') ||
-    req.get('x-timestamp') ||
-    req.get('timestamp') ||
-    '';
+  const sigHeader = req.get('x-webhook-signature') || req.get('x-saspay-signature') || req.get('signature');
+  const tsHeader = req.get('x-webhook-timestamp') || req.get('x-saspay-timestamp') || req.get('timestamp');
 
   const candidateSignatures = extractCandidateSignatures(sigHeader);
   if (candidateSignatures.size === 0) {
@@ -184,12 +200,12 @@ function verifySasPaySignature(req) {
 }
 
 /**
- * Traitement des webhooks SasPay
+ * Traitement des webhooks SasPay avec fallback API Zero-Trust
  */
 async function handleSasPayWebhook(req, res) {
   const verification = verifySasPaySignature(req);
   if (!verification.valid) {
-    console.warn(`[SasPay Webhook]: Signature HMAC non validée (${verification.reason}). Tentative de vérification officielle via API SasPay...`);
+    console.warn(`[SasPay Webhook]: Signature HMAC non validée (${verification.reason}). Tentative API SasPay...`);
   }
 
   const payload = req.body;
@@ -204,21 +220,20 @@ async function handleSasPayWebhook(req, res) {
   let isOrder = true;
 
   if (transactionId) {
-    const { data: escrow } = await supabase
-      .from('escrow_transactions')
-      .select('*')
-      .or(`id.eq.${transactionId},payment_reference.eq.${transactionId}`)
-      .maybeSingle();
-
+    const escrow = await findTransactionByIdOrToken(supabase, {
+      table: 'escrow_transactions',
+      tokenColumn: 'payment_reference',
+      rawIdentifier: transactionId,
+    });
     if (escrow) {
       tx = escrow;
       isOrder = true;
     } else {
-      const { data: monTx } = await supabase
-        .from('monetization_transactions')
-        .select('*')
-        .or(`id.eq.${transactionId},provider_token.eq.${transactionId}`)
-        .maybeSingle();
+      const monTx = await findTransactionByIdOrToken(supabase, {
+        table: 'monetization_transactions',
+        tokenColumn: 'provider_token',
+        rawIdentifier: transactionId,
+      });
       if (monTx) {
         tx = monTx;
         isOrder = false;
@@ -227,11 +242,11 @@ async function handleSasPayWebhook(req, res) {
   }
 
   if (!tx && data?.id) {
-    const { data: monTx } = await supabase
-      .from('monetization_transactions')
-      .select('*')
-      .eq('provider_token', data.id)
-      .maybeSingle();
+    const monTx = await findTransactionByIdOrToken(supabase, {
+      table: 'monetization_transactions',
+      tokenColumn: 'provider_token',
+      rawIdentifier: data.id,
+    });
     if (monTx) {
       tx = monTx;
       isOrder = false;
@@ -239,19 +254,16 @@ async function handleSasPayWebhook(req, res) {
   }
 
   if (!tx) {
-    console.log(`[SasPay Webhook]: Transaction ignorée (${transactionId || data?.id})`);
     return res.status(200).json({ ok: true, message: 'Transaction ignorée' });
   }
 
   const table = isOrder ? 'escrow_transactions' : 'monetization_transactions';
   if ((isOrder && tx.status !== 'pending') || (!isOrder && tx.status === 'confirmed')) {
-    console.log(`[SasPay Webhook]: Transaction ${tx.id} déjà confirmée`);
     return res.json({ ok: true, message: 'Déjà confirmée' });
   }
 
   const token = isOrder ? tx.payment_reference : tx.provider_token;
 
-  // Interrogation directe de l'API officielle SasPay (Zero-Trust)
   let isApiPaid = false;
   let session = null;
 
@@ -269,7 +281,6 @@ async function handleSasPayWebhook(req, res) {
     }
   }
 
-  // Rejet si HMAC invalide ET que l'API SasPay ne confirme pas le paiement
   if (!verification.valid && !isApiPaid) {
     console.warn(`[SasPay Webhook Rejected]: ${verification.reason} pour tx=${tx.id}`);
     return res.status(403).json({ ok: false, message: verification.reason });
@@ -278,7 +289,13 @@ async function handleSasPayWebhook(req, res) {
   const isPaid = isApiPaid || (verification.valid && (data?.status === 'SUCCESS' || payload?.event === 'transaction.success'));
 
   if (isPaid) {
-    console.log(`[SasPay Webhook]: Paiement validé avec succès pour tx=${tx.id} (authentifié: ${isApiPaid ? 'API SasPay' : 'HMAC'})`);
+    const expectedAmount = Number(tx.total_amount ?? tx.amount);
+    const sessionAmount = Number(session?.amount ?? session?.total_amount ?? data?.amount ?? expectedAmount);
+    if (Number.isFinite(expectedAmount) && expectedAmount > 0 && sessionAmount + 1 < expectedAmount) {
+      console.warn(`[SasPay Webhook]: Montant payé insuffisant tx=${tx.id} payé=${sessionAmount} attendu=${expectedAmount}`);
+      return res.json({ ok: true, status: 'underpaid', paid: sessionAmount, expected: expectedAmount });
+    }
+
     if (isOrder) {
       await createOrderFromEscrow(supabase, tx, metadata);
     } else {
@@ -295,7 +312,6 @@ async function handleSasPayWebhook(req, res) {
   return res.json({ ok: true, status: 'pending' });
 }
 
-// 2) Webhook unifié MoneyFusion / SasPay
 router.post('/payment-webhook', async (req, res) => {
   try {
     checkConfig();
@@ -304,15 +320,13 @@ router.post('/payment-webhook', async (req, res) => {
 
     if (personal) {
       return await handleMoneyFusionWebhook(req, res, personal);
-    } else {
-      return await handleSasPayWebhook(req, res);
     }
+    return await handleSasPayWebhook(req, res);
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
-// Endpoint dédié explicite SasPay
 router.post('/saspay-webhook', handleSasPayWebhook);
 
 module.exports = router;

@@ -1,23 +1,13 @@
 const crypto = require('crypto');
 const { sendPushToUser } = require('./push');
-
-// Tarification : une seule implémentation, partagée avec `payments.js` et
-// vérifiée par le test de parité. Ce fichier en portait sa propre copie.
 const { PRICING, haversineDistance, calculateDeliveryFee } = require('./pricing');
 
 const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 
 /**
- * Crée l'order + delivery_assignment UNIQUEMENT quand le paiement est confirmé.
- *
- * Idempotent, y compris en cas d'appels simultanés : le webhook MoneyFusion et
- * le polling `check-payment` arrivent souvent ensemble. Ils lisaient tous deux
- * `order_id = null` et créaient chacun la commande (doublon + stock décrémenté
- * deux fois). L'escrow est maintenant réservé par un UPDATE conditionnel
- * `pending → funded` ; seul l'appel qui l'obtient crée la commande.
- *
- * @returns {Promise<string|null>} order_id, ou null si un autre appel est en
- *   train de la créer.
+ * Crée les commandes et courses à partir d'un séquestre financé.
+ * Idempotent et atomique : un UPDATE conditionnel `pending → funded` garantit
+ * qu'un seul appel (webhook ou polling) crée les commandes.
  */
 async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   if (escrow.order_id) {
@@ -45,8 +35,6 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
   try {
     return await createOrdersForClaimedEscrow(supabase, escrow, personalInfo);
   } catch (err) {
-    // Rien n'a été créé de façon exploitable : on rend l'escrow pour que la
-    // prochaine notification réessaie.
     await supabase
       .from('escrow_transactions')
       .update({ status: 'pending', funded_at: null })
@@ -57,11 +45,8 @@ async function createOrderFromEscrow(supabase, escrow, personalInfo) {
 }
 
 async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
-
   const meta = escrow.order_metadata || {};
-
-  const rawItems =
-    Array.isArray(meta.items) && meta.items.length > 0 ? meta.items : [meta];
+  const rawItems = Array.isArray(meta.items) && meta.items.length > 0 ? meta.items : [meta];
   const isLegacySingle = rawItems.length === 1 && meta.items == null;
 
   const items = rawItems.map((i) => ({
@@ -80,6 +65,9 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     delivery_fee: i.delivery_fee != null ? i.delivery_fee : isLegacySingle ? escrow.delivery_fee || 0 : 0,
     platform_fee: i.platform_fee != null ? i.platform_fee : isLegacySingle ? escrow.platform_fee || 0 : 0,
     seller_amount: i.seller_amount != null ? i.seller_amount : isLegacySingle ? escrow.seller_amount : null,
+    delivery_lat: i.delivery_lat ?? null,
+    delivery_lng: i.delivery_lng ?? null,
+    distance_km: i.distance_km ?? null,
   }));
 
   const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
@@ -93,21 +81,21 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
   }
 
   let firstOrderId = null;
+  const orderIds = [];
 
   for (const [sellerId, group] of groups.entries()) {
     const productAmount = group.reduce((s, i) => s + (i.product_amount || 0), 0);
     const deliveryFee = group.reduce((s, i) => s + (i.delivery_fee || 0), 0);
     const platformFee = group.reduce((s, i) => s + (i.platform_fee || 0), 0);
-    // `platform_fee` des articles = frais de service ACHETEUR. En base,
-    // `orders.platform_commission` porte la commission VENDEUR et `reserve_fee`
-    // les frais acheteur (create_cod_order, record_cod_receivable, rapports).
-    // Les commandes en ligne inversaient les deux.
-    const sellerCommission = group.reduce(
-      (s, i) => s + (i.seller_amount != null ? Math.max(0, (i.product_amount || 0) - i.seller_amount) : 0),
+    const sellerNetAmount = group.reduce(
+      (s, i) => s + (i.seller_amount != null ? i.seller_amount : (i.product_amount || 0)),
       0
     );
+    const sellerCommission = Math.max(0, productAmount - sellerNetAmount);
+    const driverCommission = Math.round(deliveryFee * 0.10);
+    const driverNetAmount = Math.max(0, deliveryFee - driverCommission);
     const totalQuantity = group.reduce((s, i) => s + i.quantity, 0);
-    const orderTotal = productAmount + deliveryFee + platformFee;
+    const orderTotal = Math.max(0, productAmount + deliveryFee + platformFee);
     const first = group[0];
 
     const { data: order, error: orderErr } = await supabase
@@ -127,6 +115,9 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
         total_amount: orderTotal,
         delivery_address: address,
         delivery_mode: deliveryMode,
+        delivery_lat: isPickup ? null : first.delivery_lat,
+        delivery_lng: isPickup ? null : first.delivery_lng,
+        distance_km: first.distance_km,
         status: 'paid',
       })
       .select('id')
@@ -136,11 +127,47 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       console.error('Order creation error:', orderErr);
       throw new Error('Erreur création order: ' + (orderErr?.message || 'unknown'));
     }
-    if (!firstOrderId) {
+
+    orderIds.push(order.id);
+
+    if (sellerIndex === 0) {
       firstOrderId = order.id;
-      // Inscrit tout de suite : si la suite échoue, l'escrow n'est plus remis
-      // en attente (voir createOrderFromEscrow) et rien n'est recréé.
-      await supabase.from('escrow_transactions').update({ order_id: order.id }).eq('id', escrow.id);
+      // Mise à jour du séquestre principal avec les montants exacts du vendeur 1
+      await supabase
+        .from('escrow_transactions')
+        .update({
+          order_id: order.id,
+          seller_id: sellerId,
+          total_amount: orderTotal,
+          seller_amount: sellerNetAmount,
+          driver_amount: driverNetAmount,
+          delivery_fee: deliveryFee,
+          platform_fee: platformFee + sellerCommission + driverCommission,
+        })
+        .eq('id', escrow.id);
+    } else {
+      // Séquestre dédié pour chaque vendeur supplémentaire afin que verify_delivery
+      // et complete_pickup_order déclenchent le versement exact de chaque vendeur et livreur.
+      await supabase.from('escrow_transactions').insert({
+        order_id: order.id,
+        buyer_id: escrow.buyer_id,
+        seller_id: sellerId,
+        total_amount: orderTotal,
+        seller_amount: sellerNetAmount,
+        driver_amount: driverNetAmount,
+        delivery_fee: deliveryFee,
+        platform_fee: platformFee + sellerCommission + driverCommission,
+        status: 'funded',
+        funded_at: escrow.funded_at || new Date().toISOString(),
+        payment_method: escrow.payment_method || 'mobile_money',
+        payment_reference: escrow.payment_reference ? `${escrow.payment_reference}_s${sellerIndex + 1}` : null,
+        order_metadata: {
+          parent_escrow_id: escrow.id,
+          items: group,
+          delivery_address: address,
+          delivery_mode: deliveryMode,
+        },
+      });
     }
 
     const itemsPayload = group.map((i) => ({
@@ -157,7 +184,6 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       console.error('order_items creation error:', itemsErr.message);
     }
 
-    // Décrémenter le stock de chaque article et marquer comme vendu si stock = 0
     for (const it of group) {
       try {
         const { data: curListing } = await supabase
@@ -196,12 +222,13 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       try {
         const { data: sellerData } = await supabase
           .from('users')
-          .select('shop_name, district, full_name')
+          .select('shop_name, district, full_name, address')
           .eq('id', sellerId)
           .maybeSingle();
         if (sellerData) {
-          const shop = sellerData.shop_name || sellerData.full_name || 'Boutique';
-          pickupLocation = sellerData.district ? `Quartier ${sellerData.district} — ${shop}` : shop;
+          const shop = sellerData.shop_name?.trim() || sellerData.full_name?.trim() || 'Boutique';
+          const sellerDistrict = sellerData.district?.trim();
+          pickupLocation = sellerDistrict ? `Quartier ${sellerDistrict} — ${shop}` : shop;
         }
       } catch (err) {
         console.warn('[escrow] Erreur résolution boutique vendeur:', err);
@@ -209,8 +236,9 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     }
 
     let dropoffLocation = address || 'Retrait en boutique';
-    if (!isPickup && meta?.delivery_district && !dropoffLocation.toLowerCase().includes(meta.delivery_district.toLowerCase())) {
-      dropoffLocation = `Quartier ${meta.delivery_district} — ${dropoffLocation}`;
+    const dropoffDistrict = meta?.delivery_district || group[0]?.delivery_district;
+    if (!isPickup && dropoffDistrict && !dropoffLocation.toLowerCase().includes(dropoffDistrict.toLowerCase())) {
+      dropoffLocation = `Quartier ${dropoffDistrict} — ${dropoffLocation}`;
     }
 
     const pickupOTP = generateOTP();
@@ -234,8 +262,8 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     if (sellerId) {
       const count = group.length;
       sendPushToUser(sellerId, {
-        title: '🎉 Nouvelle commande reçue !',
-        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} • ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA. Préparez le colis ! 📦`,
+        title: 'Nouvelle commande reçue',
+        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} • ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA. Préparez le colis.`,
         channelId: 'orders',
         url: `/mes-commandes`,
         tag: `order-${order.id}`,
@@ -244,10 +272,20 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     }
   }
 
-  await supabase
-    .from('escrow_transactions')
-    .update({ order_id: firstOrderId })
-    .eq('id', escrow.id);
+  // Initialisation de la tournée groupée multi-vendeurs (F06) si >= 2 vendeurs en livraison
+  if (!isPickup && orderIds.length > 1) {
+    try {
+      await supabase.rpc('setup_grouped_delivery_run', {
+        p_order_ids: orderIds,
+        p_dropoff_address: address,
+        p_dropoff_district: meta?.delivery_district || items[0]?.delivery_district || null,
+        p_dropoff_lat: items[0]?.delivery_lat ?? null,
+        p_dropoff_lng: items[0]?.delivery_lng ?? null,
+      });
+    } catch (grpErr) {
+      console.error('[escrow] Erreur initialisation livraison groupée:', grpErr);
+    }
+  }
 
   return firstOrderId;
 }

@@ -4,7 +4,6 @@ const { checkConfig, getSupabaseAdminClient } = require('../config/env');
 const { requireAuthenticatedUser } = require('../middlewares/auth');
 const { QuoteError, buildOrderQuote, saveQuote } = require('../services/quote');
 
-// 0) Devis de commande : calculé une fois ici, affiché tel quel par le client
 router.post('/quote', requireAuthenticatedUser, async (req, res) => {
   try {
     checkConfig();
@@ -20,7 +19,11 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
 
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
     const quote = await buildOrderQuote(supabase, { rawItems, phaseConfig });
-    const saved = await saveQuote(supabase, req.user.id, quote, rawItems[0]?.delivery_address);
+    const saved = await saveQuote(supabase, {
+      buyerId: req.user.id,
+      quote,
+      deliveryAddress: rawItems[0]?.delivery_address,
+    });
 
     return res.json({
       success: true,
@@ -46,4 +49,3 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
 });
 
 module.exports = router;
-

@@ -1,8 +1,15 @@
-const { ENV, getSupabaseAdminClient } = require('../config/env');
+const { getSupabaseAdminClient } = require('../config/env');
 const { sendPushToUser } = require('./push');
+const { DEFAULT_PUSH_CONCURRENCY, runWithConcurrency } = require('./push-dispatch-batch');
+const {
+  splitIntoChunks,
+  resolveRecipientDisplayName,
+  renderCampaignTemplate,
+  resolveRecipientTargetUrl,
+} = require('./push-template');
 
-const SUPPORT_WHATSAPP_NUMBER = '+225 07 04 16 33 61';
-const OFFICIAL_WHATSAPP_CHANNEL = 'https://whatsapp.com/channel/0029Vb94o2vJENy5kkADR42U';
+const SUBSCRIPTION_CHUNK_SIZE = 200;
+
 const VALID_SEGMENTS = [
   'dormant',
   'active_seller',
@@ -10,80 +17,127 @@ const VALID_SEGMENTS = [
   'buyer_cancelled',
 ];
 
-/**
- * Extrait le prénom ou nom d'affichage d'un utilisateur pour personnaliser sa notification.
- * @param {object} user Enregistrement issu de `public.users`
- * @returns {string} Prénom ou nom de boutique, avec repli sur "l'ami"
- */
-function resolveRecipientDisplayName(user) {
-  const fullName = String(user?.full_name || '').trim();
-  if (fullName) {
-    return fullName.split(/\s+/)[0];
+async function fetchListingActivityForUsers(supabase, userIds) {
+  const anyListing = new Set();
+  const activeListing = new Set();
+  const activePromo = new Set();
+
+  for (const chunk of splitIntoChunks(userIds, SUBSCRIPTION_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from('listings')
+      .select('user_id, status, price, original_price')
+      .neq('status', 'deleted')
+      .in('user_id', chunk);
+
+    if (error) throw new Error(`Erreur lecture annonces ciblées: ${error.message}`);
+
+    for (const row of data || []) {
+      if (!row.user_id) continue;
+      anyListing.add(row.user_id);
+      if (row.status !== 'active') continue;
+      activeListing.add(row.user_id);
+      if (row.original_price != null && Number(row.original_price) > Number(row.price)) {
+        activePromo.add(row.user_id);
+      }
+    }
   }
-  const shopName = String(user?.shop_name || '').trim();
-  if (shopName) {
-    return shopName;
+
+  return { anyListing, activeListing, activePromo };
+}
+
+async function fetchOrderActivityForUsers(supabase, userIds) {
+  const validOrder = new Set();
+  const cancelledOrder = new Set();
+
+  for (const chunk of splitIntoChunks(userIds, SUBSCRIPTION_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('buyer_id, status')
+      .in('buyer_id', chunk);
+
+    if (error) throw new Error(`Erreur lecture commandes ciblées: ${error.message}`);
+
+    for (const row of data || []) {
+      if (!row.buyer_id) continue;
+      if (row.status === 'cancelled') cancelledOrder.add(row.buyer_id);
+      else validOrder.add(row.buyer_id);
+    }
   }
-  return "l'ami";
+
+  return { validOrder, cancelledOrder };
 }
 
-/**
- * Construit le lien public de partage de la boutique d'un vendeur (sans https:// pour tenir dans une notif).
- * @param {object} user Enregistrement issu de `public.users`
- * @returns {string} Lien court de la boutique (ex: daloamarket.com/shop/ma-boutique)
- */
-function buildRecipientShopShareLink(user) {
-  const baseHost = String(ENV.SITE_URL || 'https://daloamarket.com')
-    .replace(/^https?:\/\//i, '')
-    .replace(/\/$/, '');
-  const slug = String(user?.shop_slug || '').trim();
-  if (slug) {
-    return `${baseHost}/shop/${slug}`;
+function matchesSegment(uid, segment, activity) {
+  const { anyListing, activeListing, activePromo, validOrder, cancelledOrder } = activity;
+  if (segment === 'dormant') {
+    return !anyListing.has(uid) && !validOrder.has(uid);
   }
-  const rawId = String(user?.id || '').trim();
-  const shortId = rawId.length >= 8 ? rawId.slice(0, 8) : rawId;
-  return shortId ? `${baseHost}/b/${shortId}` : baseHost;
+  if (segment === 'seller_no_promo') {
+    return activeListing.has(uid) && !activePromo.has(uid);
+  }
+  if (segment === 'buyer_cancelled') {
+    return cancelledOrder.has(uid) && !validOrder.has(uid);
+  }
+  return activeListing.has(uid);
 }
 
 /**
- * Construit le chemin d'ouverture au clic adapté au destinataire.
- * Remplace les variables dynamiques éventuellement présentes dans l'URL.
- * @param {string} rawUrl URL ou route configurée dans la campagne
- * @param {object} user Enregistrement issu de `public.users`
- * @returns {string} URL ou chemin résolu
+ * Repli borné sans scan global de base lorsque la RPC SQL n'est pas encore déployée :
+ * charge uniquement les `user_id` abonnés puis filtre par lots de 200 utilisateurs.
  */
-function resolveRecipientTargetUrl(rawUrl, user) {
-  const cleanUrl = String(rawUrl || '/').trim() || '/';
-  return renderCampaignTemplate(cleanUrl, user);
+async function fetchRecipientsViaBatchedQueries(supabase, segment) {
+  const { data: subsData, error: subsError } = await supabase
+    .from('push_subscriptions')
+    .select('user_id')
+    .eq('is_active', true)
+    .or('app_type.is.null,app_type.eq.market');
+
+  if (subsError) {
+    throw new Error(`Erreur lecture abonnements push: ${subsError.message}`);
+  }
+
+  const subscribedIds = Array.from(
+    new Set((subsData || []).map((s) => s.user_id).filter(Boolean))
+  );
+  if (subscribedIds.length === 0) return [];
+
+  const needOrders = segment === 'dormant' || segment === 'buyer_cancelled';
+  const needListings = segment !== 'buyer_cancelled';
+
+  const [listingActivity, orderActivity] = await Promise.all([
+    needListings
+      ? fetchListingActivityForUsers(supabase, subscribedIds)
+      : Promise.resolve({ anyListing: new Set(), activeListing: new Set(), activePromo: new Set() }),
+    needOrders
+      ? fetchOrderActivityForUsers(supabase, subscribedIds)
+      : Promise.resolve({ validOrder: new Set(), cancelledOrder: new Set() }),
+  ]);
+
+  const activity = { ...listingActivity, ...orderActivity };
+  const matchingIds = subscribedIds.filter((uid) => matchesSegment(uid, segment, activity));
+  if (matchingIds.length === 0) return [];
+
+  const users = [];
+  for (const chunk of splitIntoChunks(matchingIds, SUBSCRIPTION_CHUNK_SIZE)) {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, full_name, shop_name, shop_slug')
+      .in('id', chunk)
+      .neq('banned', true)
+      .is('deleted_at', null);
+
+    if (error) throw new Error(`Erreur lecture profils utilisateurs: ${error.message}`);
+    if (data) users.push(...data);
+  }
+
+  return users;
 }
 
 /**
- * Remplace les variables dynamiques (`$nom`, `{nom}`, `$lien`, `{lien}`,
- * `$chaine`, `{chaine}`, `$numero`, `{numero}`) dans un texte de notification.
- * Fonction pure : ne mute aucun argument.
- * @param {string} template Texte contenant des variables
- * @param {object} user Enregistrement utilisateur (`id`, `full_name`, `shop_name`, `shop_slug`)
- * @returns {string} Texte personnalisé prêt à l'envoi
- */
-function renderCampaignTemplate(template, user) {
-  if (!template) return '';
-  const displayName = resolveRecipientDisplayName(user);
-  const shopLink = buildRecipientShopShareLink(user);
-
-  return String(template)
-    .replace(/\{nom\}|\$nom\b/gi, displayName)
-    .replace(/\{lien\}|\$lien\b/gi, shopLink)
-    .replace(/\{chaine(?:\s*wa)?\}|\$chaine(?:\s*wa)?\b/gi, OFFICIAL_WHATSAPP_CHANNEL)
-    .replace(/\{\+?numero(?:\s*wa)?\}|\$\+?numero(?:\s*wa)?\b/gi, SUPPORT_WHATSAPP_NUMBER);
-}
-
-/**
- * Récupère les utilisateurs disposant d'au moins un abonnement push actif sur DaloaMarket
- * et les filtre selon le segment demandé :
- * - `dormant` : 0 annonce publiée ET 0 commande passée
- * - `active_seller` : au moins 1 annonce active en ligne
+ * Récupère les utilisateurs éligibles d'un segment via la RPC SQL filtrée
+ * `get_campaign_target_user_ids` (avec repli par lots bornés si RPC absente).
  * @param {object} supabase Client Supabase Admin
- * @param {'dormant'|'active_seller'} segment Identifiant du segment cible
+ * @param {string} segment Identifiant du segment cible
  * @returns {Promise<Array<object>>} Liste dédoublonnée des profils éligibles
  */
 async function fetchCampaignSegmentRecipients(supabase, segment) {
@@ -91,96 +145,30 @@ async function fetchCampaignSegmentRecipients(supabase, segment) {
     throw new Error(`Segment inconnu : ${segment}`);
   }
 
-  const [subsRes, listingsRes, ordersRes] = await Promise.all([
-    supabase
-      .from('push_subscriptions')
-      .select('user_id, app_type')
-      .eq('is_active', true),
-    supabase
-      .from('listings')
-      .select('user_id, status, price, original_price')
-      .neq('status', 'deleted'),
-    supabase
-      .from('orders')
-      .select('buyer_id, status'),
-  ]);
-
-  if (subsRes.error) throw new Error(`Erreur lecture abonnements push: ${subsRes.error.message}`);
-  if (listingsRes.error) throw new Error(`Erreur lecture annonces: ${listingsRes.error.message}`);
-  if (ordersRes.error) throw new Error(`Erreur lecture commandes: ${ordersRes.error.message}`);
-
-  const subscribedMarketUserIds = new Set(
-    (subsRes.data || [])
-      .filter((s) => s.user_id && (s.app_type || 'market') === 'market')
-      .map((s) => s.user_id)
-  );
-
-  if (subscribedMarketUserIds.size === 0) {
-    return [];
-  }
-
-  const usersWithAnyListing = new Set();
-  const usersWithActiveListing = new Set();
-  const usersWithActivePromo = new Set();
-  for (const row of listingsRes.data || []) {
-    if (!row.user_id) continue;
-    usersWithAnyListing.add(row.user_id);
-    if (row.status === 'active') {
-      usersWithActiveListing.add(row.user_id);
-      if (row.original_price != null && Number(row.original_price) > Number(row.price)) {
-        usersWithActivePromo.add(row.user_id);
-      }
-    }
-  }
-
-  const usersWithValidOrder = new Set();
-  const usersWithCancelledOrder = new Set();
-  for (const o of ordersRes.data || []) {
-    if (!o.buyer_id) continue;
-    if (o.status === 'cancelled') {
-      usersWithCancelledOrder.add(o.buyer_id);
-    } else {
-      usersWithValidOrder.add(o.buyer_id);
-    }
-  }
-
-  const matchingUserIds = Array.from(subscribedMarketUserIds).filter((uid) => {
-    if (segment === 'dormant') {
-      return !usersWithAnyListing.has(uid) && !usersWithValidOrder.has(uid);
-    }
-    if (segment === 'seller_no_promo') {
-      return usersWithActiveListing.has(uid) && !usersWithActivePromo.has(uid);
-    }
-    if (segment === 'buyer_cancelled') {
-      return usersWithCancelledOrder.has(uid) && !usersWithValidOrder.has(uid);
-    }
-    return usersWithActiveListing.has(uid);
+  const { data: rpcUsers, error: rpcError } = await supabase.rpc('get_campaign_target_user_ids', {
+    p_segment: segment,
   });
 
-  if (matchingUserIds.length === 0) {
-    return [];
+  if (!rpcError && Array.isArray(rpcUsers)) {
+    return rpcUsers;
   }
 
-  const { data: users, error: usersErr } = await supabase
-    .from('users')
-    .select('id, full_name, shop_name, shop_slug')
-    .in('id', matchingUserIds);
+  const isMissingRpc =
+    rpcError?.code === '42883' ||
+    rpcError?.code === 'PGRST202' ||
+    String(rpcError?.message || '').includes('get_campaign_target_user_ids');
 
-  if (usersErr) {
-    throw new Error(`Erreur lecture profils utilisateurs: ${usersErr.message}`);
+  if (!isMissingRpc) {
+    throw new Error(`Erreur RPC ciblage campagne: ${rpcError?.message || 'inconnue'}`);
   }
 
-  return users || [];
+  console.warn('[PushCampaigns] RPC get_campaign_target_user_ids absente, repli par lots bornés.');
+  return fetchRecipientsViaBatchedQueries(supabase, segment);
 }
 
 /**
  * Exécute ou prévisualise une campagne push personnalisée par segment.
  * @param {object} config Configuration de la campagne
- * @param {'dormant'|'active_seller'} config.segment Segment cible
- * @param {string} config.title Modèle de titre (supporte `$nom`, `$lien`, etc.)
- * @param {string} config.body Modèle de message (supporte `$nom`, `$lien`, etc.)
- * @param {string} [config.url] Lien d'ouverture au clic
- * @param {boolean} [config.dryRun] Si vrai, retourne uniquement le nombre de cibles et 3 aperçus
  * @returns {Promise<object>} Résultat d'aperçu ou rapport d'envoi
  */
 async function executeSegmentedPushCampaign(config) {
@@ -210,8 +198,9 @@ async function executeSegmentedPushCampaign(config) {
     };
   }
 
-  const dispatchResults = await Promise.allSettled(
-    recipients.map((user) =>
+  const dispatchResults = await runWithConcurrency(
+    recipients,
+    (user) =>
       sendPushToUser(
         user.id,
         {
@@ -222,8 +211,8 @@ async function executeSegmentedPushCampaign(config) {
           icon: '/web-app-manifest-192x192.png',
         },
         { appType: 'market' }
-      )
-    )
+      ),
+    DEFAULT_PUSH_CONCURRENCY
   );
 
   const devicesSent = dispatchResults.reduce(
@@ -247,4 +236,3 @@ module.exports = {
   fetchCampaignSegmentRecipients,
   executeSegmentedPushCampaign,
 };
-
