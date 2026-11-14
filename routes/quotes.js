@@ -19,7 +19,11 @@ router.post('/quote', requireAuthenticatedUser, async (req, res) => {
 
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
     const quote = await buildOrderQuote(supabase, { rawItems, phaseConfig });
-    const saved = await saveQuote(supabase, req.user.id, quote, rawItems[0]?.delivery_address);
+    const saved = await saveQuote(supabase, {
+      buyerId: req.user.id,
+      quote,
+      deliveryAddress: rawItems[0]?.delivery_address,
+    });
 
     return res.json({
       success: true,

@@ -32,7 +32,17 @@ const GEOFENCE_RADIUS_KM = 10;
 
 const MAPBOX_TOKEN = (process.env.MAPBOX_TOKEN || process.env.VITE_MAPBOX_TOKEN || '').trim();
 
-function haversineDistance(lat1, lon1, lat2, lon2) {
+/**
+ * Calcule la distance à vol d'oiseau (en km) entre deux coordonnées GPS.
+ * @param {{ lat?: number, latitude?: number, lng?: number, longitude?: number }} origin
+ * @param {{ lat?: number, latitude?: number, lng?: number, longitude?: number }} destination
+ * @returns {number}
+ */
+function haversineDistance(origin, destination) {
+  const lat1 = Number(origin?.lat ?? origin?.latitude ?? 0);
+  const lon1 = Number(origin?.lng ?? origin?.longitude ?? 0);
+  const lat2 = Number(destination?.lat ?? destination?.latitude ?? 0);
+  const lon2 = Number(destination?.lng ?? destination?.longitude ?? 0);
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLon = ((lon2 - lon1) * Math.PI) / 180;
@@ -56,9 +66,10 @@ function isLocationInDaloa(lat, lng) {
   const nLat = Number(lat);
   const nLng = Number(lng);
   if (!Number.isFinite(nLat) || !Number.isFinite(nLng)) return false;
-  return haversineDistance(nLat, nLng, DALOA_CENTER.lat, DALOA_CENTER.lng) <= GEOFENCE_RADIUS_KM;
+  return haversineDistance({ lat: nLat, lng: nLng }, DALOA_CENTER) <= GEOFENCE_RADIUS_KM;
 }
 
+/** Calcule les frais de livraison arrondis aux 50 FCFA à partir de la distance routière. */
 function calculateDeliveryFee(distanceKm) {
   const km = Number(distanceKm) || 0;
   const extra =
@@ -81,8 +92,11 @@ function parseDistrictFromAddress(address) {
  * Point retenu : GPS si exploitable → barycentre du quartier → centre de Daloa.
  * `districts` est une table {nom: {latitude, longitude}} chargée depuis la base
  * (`daloa_districts`), pour ne pas dupliquer 37 coordonnées ici.
+ * @param {{ lat?: number|null, lng?: number|null, district?: string|null }} coords
+ * @param {Record<string, { latitude: number, longitude: number }>} districts
+ * @returns {{ lat: number, lng: number }}
  */
-function resolvePoint(lat, lng, district, districts) {
+function resolvePoint({ lat, lng, district }, districts) {
   if (isLocationInDaloa(lat, lng)) {
     return { lat: Number(lat), lng: Number(lng) };
   }
@@ -103,58 +117,71 @@ async function fetchWithTimeout(url, timeoutMs) {
   }
 }
 
+async function fetchMapboxDrivingKm(origin, destination) {
+  if (!MAPBOX_TOKEN) return null;
+  try {
+    const url =
+      `https://api.mapbox.com/directions/v5/mapbox/driving/` +
+      `${origin.lng},${origin.lat};${destination.lng},${destination.lat}` +
+      `?overview=false&access_token=${MAPBOX_TOKEN}`;
+    const res = await fetchWithTimeout(url, 4000);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const route = data?.routes?.[0];
+    return route && route.distance > 0 ? clampBillableDistanceKm(route.distance / 1000) : null;
+  } catch (err) {
+    console.warn('[Pricing] Mapbox indisponible, repli OSRM:', err?.message || err);
+    return null;
+  }
+}
+
+async function fetchOsrmDrivingKm(origin, destination) {
+  try {
+    const url =
+      `https://router.project-osrm.org/route/v1/driving/` +
+      `${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=false`;
+    const res = await fetchWithTimeout(url, 3500);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const route = data?.routes?.[0];
+    return route && route.distance > 0 ? clampBillableDistanceKm(route.distance / 1000) : null;
+  } catch (err) {
+    console.warn('[Pricing] OSRM indisponible, repli géométrique:', err?.message || err);
+    return null;
+  }
+}
+
 /**
  * Distance facturable : itinéraire routier réel (Mapbox puis OSRM), à défaut le
  * vol d'oiseau majoré. Même cascade et mêmes délais que `getDrivingRoute` côté
  * applications, pour que le montant affiché et le montant facturé coïncident.
  */
 async function resolveBillableDistanceKm(origin, destination) {
-  const straight = haversineDistance(origin.lat, origin.lng, destination.lat, destination.lng);
+  const mapboxKm = await fetchMapboxDrivingKm(origin, destination);
+  if (mapboxKm !== null) return mapboxKm;
 
-  if (MAPBOX_TOKEN) {
-    try {
-      const url =
-        `https://api.mapbox.com/directions/v5/mapbox/driving/` +
-        `${origin.lng},${origin.lat};${destination.lng},${destination.lat}` +
-        `?overview=false&access_token=${MAPBOX_TOKEN}`;
-      const res = await fetchWithTimeout(url, 4000);
-      if (res.ok) {
-        const data = await res.json();
-        const route = data && data.routes && data.routes[0];
-        if (route && route.distance > 0) return clampBillableDistanceKm(route.distance / 1000);
-      }
-    } catch (_) {
-      /* repli OSRM */
-    }
-  }
+  const osrmKm = await fetchOsrmDrivingKm(origin, destination);
+  if (osrmKm !== null) return osrmKm;
 
-  try {
-    const url =
-      `https://router.project-osrm.org/route/v1/driving/` +
-      `${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=false`;
-    const res = await fetchWithTimeout(url, 3500);
-    if (res.ok) {
-      const data = await res.json();
-      const route = data && data.routes && data.routes[0];
-      if (route && route.distance > 0) return clampBillableDistanceKm(route.distance / 1000);
-    }
-  } catch (_) {
-    /* repli géométrique */
-  }
-
+  const straight = haversineDistance(origin, destination);
   return clampBillableDistanceKm(straight * DISTANCE_RULE.ROAD_FACTOR);
 }
 
 /** Charge une fois les barycentres de quartiers depuis la base. */
 async function loadDistricts(supabase) {
   try {
-    const { data } = await supabase.from('daloa_districts').select('name, latitude, longitude');
+    const { data, error } = await supabase.from('daloa_districts').select('name, latitude, longitude');
+    if (error) {
+      console.warn('[Pricing] Échec chargement quartiers Daloa:', error.message);
+      return {};
+    }
     const map = {};
     for (const row of data || []) {
       map[row.name] = { latitude: row.latitude, longitude: row.longitude };
     }
     return map;
-  } catch (_) {
+  } catch (err) {
+    console.warn('[Pricing] Erreur loadDistricts:', err?.message || err);
     return {};
   }
 }

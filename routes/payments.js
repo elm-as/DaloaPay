@@ -13,12 +13,17 @@ const {
   markQuoteUsed,
 } = require('../services/quote');
 
-// Verrou en mémoire anti-clics concurrents (ex: double-tap rapide)
+// Verrou en mémoire borné anti-clics concurrents (ex: double-tap rapide)
 const inFlightRequests = new Map();
 
 function withInFlightLock(key, fn) {
+  const MAX_INFLIGHT_LOCKS = 500;
   if (inFlightRequests.has(key)) {
     return inFlightRequests.get(key);
+  }
+  if (inFlightRequests.size >= MAX_INFLIGHT_LOCKS) {
+    const oldestKey = inFlightRequests.keys().next().value;
+    if (oldestKey !== undefined) inFlightRequests.delete(oldestKey);
   }
   const promise = (async () => {
     try {
@@ -128,7 +133,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
       if (type === 'order') {
         let metaItems;
         let quoteId = null;
-        let appliedDaloaCash = 0;
         try {
           if (req.body.quoteId) {
             const quote = await loadQuoteForPayment(supabase, req.body.quoteId, userId);
@@ -152,25 +156,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
                 message: `Le prix de la livraison a été recalculé : le total est de ${finalAmount} FCFA et non ${displayedAmount} FCFA. Revenez à l'étape précédente pour actualiser.`,
               });
             }
-          }
-
-          // Validation serveur de la réduction Daloa Cash (F10)
-          const deliveryTotal = metaItems.reduce((s, i) => s + (i.delivery_fee || 0), 0);
-          const explicitDiscount = Number(req.body.daloaCashDiscount ?? req.body.daloa_cash_discount ?? metadata?.daloaCashDiscount ?? 0) || 0;
-          const implicitDiscount = quoteId && Number(amount) > 0 && Number(amount) < finalAmount
-            ? finalAmount - Number(amount)
-            : 0;
-          const requestedDiscount = Math.max(explicitDiscount, implicitDiscount);
-
-          if (requestedDiscount > 0 && deliveryTotal > 0) {
-            const { data: buyerRow } = await supabase
-              .from('users')
-              .select('daloa_cash_balance')
-              .eq('id', userId)
-              .maybeSingle();
-            const availableBalance = Math.max(0, Number(buyerRow?.daloa_cash_balance) || 0);
-            appliedDaloaCash = Math.min(requestedDiscount, availableBalance, deliveryTotal);
-            finalAmount = Math.max(0, finalAmount - appliedDaloaCash);
           }
 
           if (quoteId) await markQuoteUsed(supabase, quoteId, 'online');
@@ -198,7 +183,6 @@ router.post('/create-payment', requireAuthenticatedUser, createPaymentLimiter, a
               delivery_address: metaItems[0].delivery_address,
               delivery_mode: metaItems[0].delivery_mode,
               quote_id: quoteId,
-              daloa_cash_discount: appliedDaloaCash,
             },
           })
           .select('id')

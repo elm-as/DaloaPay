@@ -73,7 +73,6 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
   const address = meta.delivery_address || personalInfo?.delivery_address || 'Daloa';
   const deliveryMode = meta.delivery_mode || personalInfo?.delivery_mode || 'delivery';
   const isPickup = deliveryMode === 'pickup_point' || deliveryMode === 'pickup';
-  const requestedDaloaCash = Math.max(0, Number(meta.daloa_cash_discount) || 0);
 
   const groups = new Map();
   for (const it of items) {
@@ -83,7 +82,6 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
 
   let firstOrderId = null;
   const orderIds = [];
-  let sellerIndex = 0;
 
   for (const [sellerId, group] of groups.entries()) {
     const productAmount = group.reduce((s, i) => s + (i.product_amount || 0), 0);
@@ -97,8 +95,7 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     const driverCommission = Math.round(deliveryFee * 0.10);
     const driverNetAmount = Math.max(0, deliveryFee - driverCommission);
     const totalQuantity = group.reduce((s, i) => s + i.quantity, 0);
-    const orderDaloaCash = sellerIndex === 0 ? Math.min(requestedDaloaCash, deliveryFee) : 0;
-    const orderTotal = Math.max(0, productAmount + deliveryFee + platformFee - orderDaloaCash);
+    const orderTotal = Math.max(0, productAmount + deliveryFee + platformFee);
     const first = group[0];
 
     const { data: order, error: orderErr } = await supabase
@@ -115,7 +112,6 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
         delivery_fee: deliveryFee,
         platform_commission: sellerCommission,
         reserve_fee: platformFee,
-        daloa_cash_discount: orderDaloaCash,
         total_amount: orderTotal,
         delivery_address: address,
         delivery_mode: deliveryMode,
@@ -266,43 +262,13 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
     if (sellerId) {
       const count = group.length;
       sendPushToUser(sellerId, {
-        title: '🎉 Nouvelle commande reçue !',
-        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} • ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA. Préparez le colis ! 📦`,
+        title: 'Nouvelle commande reçue',
+        body: `${count} article${count > 1 ? 's' : ''} vendu${count > 1 ? 's' : ''} • ${Number(orderTotal || 0).toLocaleString('fr-FR')} FCFA. Préparez le colis.`,
         channelId: 'orders',
         url: `/mes-commandes`,
         tag: `order-${order.id}`,
         orderId: order.id,
       }).catch((e) => console.error('[Push Order Error]:', e));
-    }
-
-    sellerIndex += 1;
-  }
-
-  // Déduction effective du solde Daloa Cash de l'acheteur après confirmation du paiement
-  if (requestedDaloaCash > 0 && firstOrderId && escrow.buyer_id) {
-    try {
-      const { data: buyerRow } = await supabase
-        .from('users')
-        .select('daloa_cash_balance')
-        .eq('id', escrow.buyer_id)
-        .maybeSingle();
-      const curBalance = Number(buyerRow?.daloa_cash_balance) || 0;
-      const deducted = Math.min(curBalance, requestedDaloaCash);
-      if (deducted > 0) {
-        await supabase
-          .from('users')
-          .update({ daloa_cash_balance: Math.max(0, curBalance - deducted) })
-          .eq('id', escrow.buyer_id);
-        await supabase.from('daloa_cash_transactions').insert({
-          user_id: escrow.buyer_id,
-          amount: -deducted,
-          type: 'checkout_discount',
-          order_id: firstOrderId,
-          notes: 'Réduction Daloa Cash appliquée sur paiement Mobile Money',
-        });
-      }
-    } catch (dcErr) {
-      console.error('[escrow] Erreur déduction Daloa Cash:', dcErr);
     }
   }
 

@@ -113,15 +113,20 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
     deliveryMode = isPickupMode ? 'pickup_point' : 'delivery';
 
     const buyerDistrict = oi?.delivery_district || parseDistrictFromAddress(oi?.delivery_address);
-    const pointB = resolvePoint(oi?.delivery_lat, oi?.delivery_lng, buyerDistrict, districts);
+    const pointB = resolvePoint(
+      { lat: oi?.delivery_lat, lng: oi?.delivery_lng, district: buyerDistrict },
+      districts
+    );
     if (!buyerPoint) buyerPoint = { ...pointB, district: buyerDistrict || null };
 
     let seller = sellers.get(listing.user_id);
     if (!seller) {
       const sellerPoint = resolvePoint(
-        sellerProfile?.shop_latitude,
-        sellerProfile?.shop_longitude,
-        sellerProfile?.district,
+        {
+          lat: sellerProfile?.shop_latitude,
+          lng: sellerProfile?.shop_longitude,
+          district: sellerProfile?.district,
+        },
         districts
       );
       const distanceKm = isPickupMode ? 0 : await resolveBillableDistanceKm(sellerPoint, pointB);
@@ -210,8 +215,12 @@ async function buildOrderQuote(supabase, { rawItems, phaseConfig }) {
   };
 }
 
-/** Enregistre un devis et renvoie la ligne créée. */
-async function saveQuote(supabase, buyerId, quote, deliveryAddress) {
+/**
+ * Enregistre un devis chiffré côté serveur et renvoie la ligne créée.
+ * @param {object} supabase Client Supabase admin
+ * @param {{ buyerId: string, quote: object, deliveryAddress?: string|null }} payload
+ */
+async function saveQuote(supabase, { buyerId, quote, deliveryAddress }) {
   const expiresAt = new Date(Date.now() + QUOTE_TTL_MINUTES * 60 * 1000).toISOString();
   const { data, error } = await supabase
     .from('delivery_quotes')
