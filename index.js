@@ -91,10 +91,12 @@ app.use(async (req, res, next) => {
 
 // 5. Montage des routeurs par domaine
 app.use('/', require('./routes/health'));
+app.use('/', require('./routes/quotes'));
 app.use('/', require('./routes/payments'));
 app.use('/', require('./routes/payment-status'));
 app.use('/', require('./routes/payment-webhook'));
 app.use('/', require('./routes/payouts'));
+app.use('/', require('./routes/payout-webhook'));
 app.use('/', require('./routes/notifications'));
 app.use('/', require('./routes/channels'));
 app.use('/', require('./routes/admin-orders'));

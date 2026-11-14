@@ -11,15 +11,11 @@ function requireAdminSecret(req, res, next) {
 }
 
 /**
- * Accepte :
- * 1. Le secret machine (en-tête `x-admin-secret` ou paramètre d'URL `?secret=...` / `?key=...` / `?token=...`)
- * 2. Un utilisateur authentifié (jeton JWT Bearer)
- * 3. Un appel de planificateur externe / moniteur d'uptime (sans secret) UNIQUEMENT pour
- *    la file d'attente normale échue (`scheduled_for <= now()`), ce qui évite les faux
- *    crash 401 sur UptimeRobot.
+ * Exige soit :
+ * 1. Le secret machine valide (en-tête `x-admin-secret` ou paramètre d'URL `?secret=...` / `?key=...` / `?token=...`)
+ * 2. Un utilisateur authentifié valide (jeton JWT Bearer)
  *
- * Le paramètre `?force=true` (qui court-circuite le délai d'escrow) exige
- * impérativement le secret admin.
+ * Refuse explicitement tout accès sans secret valide (403) ou non authentifié (401).
  */
 function allowSecretOrAuthenticatedUser(req, res, next) {
   const secretCandidate = req.get('x-admin-secret') || req.query.secret || req.query.key || req.query.token;
@@ -32,13 +28,16 @@ function allowSecretOrAuthenticatedUser(req, res, next) {
     return requireAuthenticatedUser(req, res, next);
   }
 
-  // Refus strict si tentative de forcer sans secret admin
-  if (req.query.force === 'true') {
-    return res.status(403).json({ success: false, message: 'Le paramètre force=true exige un secret administrateur.' });
+  // Refus strict si tentative avec un mauvais secret
+  if (secretCandidate) {
+    return res.status(403).json({ success: false, message: 'Secret administrateur invalide.' });
   }
 
-  // File automatique normale autorisée pour les cron / UptimeRobot
-  next();
+  // Refus strict de tout accès anonyme (R3)
+  return res.status(401).json({
+    success: false,
+    message: 'Authentification requise : fournissez x-admin-secret ou un jeton Bearer valide.',
+  });
 }
 
 async function requireAuthenticatedUser(req, res, next) {

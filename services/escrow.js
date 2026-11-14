@@ -221,6 +221,30 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       }
     }
 
+    let pickupLocation = 'Boutique du vendeur';
+    if (sellerId) {
+      try {
+        const { data: sellerData } = await supabase
+          .from('users')
+          .select('shop_name, district, full_name, address')
+          .eq('id', sellerId)
+          .maybeSingle();
+        if (sellerData) {
+          const shop = sellerData.shop_name?.trim() || sellerData.full_name?.trim() || 'Boutique';
+          const sellerDistrict = sellerData.district?.trim();
+          pickupLocation = sellerDistrict ? `Quartier ${sellerDistrict} — ${shop}` : shop;
+        }
+      } catch (err) {
+        console.warn('[escrow] Erreur résolution boutique vendeur:', err);
+      }
+    }
+
+    let dropoffLocation = address || 'Retrait en boutique';
+    const dropoffDistrict = meta?.delivery_district || group[0]?.delivery_district;
+    if (!isPickup && dropoffDistrict && !dropoffLocation.toLowerCase().includes(dropoffDistrict.toLowerCase())) {
+      dropoffLocation = `Quartier ${dropoffDistrict} — ${dropoffLocation}`;
+    }
+
     const pickupOTP = generateOTP();
     const deliveryOTP = generateOTP();
     await supabase.from('delivery_assignments').insert({
@@ -232,8 +256,8 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       delivery_otp: deliveryOTP,
       pickup_otp_attempts: 0,
       delivery_otp_attempts: 0,
-      pickup_location: 'Boutique du vendeur',
-      dropoff_location: address || 'Retrait en boutique',
+      pickup_location: pickupLocation,
+      dropoff_location: dropoffLocation,
       delivery_price: deliveryFee || 0,
       seller_id: sellerId,
       is_private: isPickup,
@@ -288,7 +312,7 @@ async function createOrdersForClaimedEscrow(supabase, escrow, personalInfo) {
       await supabase.rpc('setup_grouped_delivery_run', {
         p_order_ids: orderIds,
         p_dropoff_address: address,
-        p_dropoff_district: null,
+        p_dropoff_district: meta?.delivery_district || items[0]?.delivery_district || null,
         p_dropoff_lat: items[0]?.delivery_lat ?? null,
         p_dropoff_lng: items[0]?.delivery_lng ?? null,
       });

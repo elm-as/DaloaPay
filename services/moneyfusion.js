@@ -63,7 +63,16 @@ async function sendWithdraw(payload, privateKey) {
     },
     body: JSON.stringify(payload),
   });
-  return await response.json();
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      statut: false,
+      message: `Serveur MoneyFusion indisponible (HTTP ${response.status} - non JSON)`,
+      raw: text.slice(0, 200),
+    };
+  }
 }
 
 module.exports = {
